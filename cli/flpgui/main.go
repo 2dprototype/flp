@@ -2759,7 +2759,7 @@ func openAboutTool(_ *wui.Window) {
 	w := newModal("About")
 
 	lines := []string{
-		"FLP Studio Tool",
+		"FLP Tool",
 		"Version " + version,
 		"",
 		"A small toolbox for FL Studio (.flp) project files:",
