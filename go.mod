@@ -10,5 +10,6 @@ require (
 
 require (
 	github.com/gonutz/w32/v2 v2.12.1 // indirect
+	gitlab.com/gomidi/midi/v2 v2.3.24 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 )

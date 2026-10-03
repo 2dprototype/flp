@@ -1,6 +1,6 @@
 // Command flp-gui is a desktop toolbox for FL Studio (.flp) project files.
 //
-// Fixed 640x430 windows. Every tool opens as a modal.
+// Resizable windows. Every tool opens as a modal.
 // Features: semantic diff, project inspector, visualiser (with scroll),
 // channel / pattern / mixer browsers, git integration, and an editor.
 package main
@@ -15,14 +15,18 @@ import (
 
 	"github.com/2dprototype/flp"
 	"github.com/gonutz/wui/v2"
+	
+	"sort"
+	"gitlab.com/gomidi/midi/v2"
+	"gitlab.com/gomidi/midi/v2/smf"
 )
 
 // ───────────────────────── constants ─────────────────────────
 
 const (
-	winW    = 640
-	winH    = 430
-	version = "0.1.2"
+	defaultW = 780
+	defaultH = 560
+	version  = "0.2.0"
 
 	vizHeaderH    = 44
 	scrollbarSize = 12
@@ -33,6 +37,17 @@ const (
 	basePxPerTick = 0.15 // pixels-per-tick at zoomX = 1
 	baseTrackH    = 22   // track row height at zoomY = 1
 	baseKeyH      = 12   // piano key height at zoomY = 1
+
+	// Shared layout metrics.
+	margin      = 16
+	rowGap      = 8
+	editH       = 26
+	labelH      = 20
+	btnH        = 26
+	closeBtnW   = 100
+	fileLabelW  = 70
+	fileBtnW    = 110
+	rowInnerGap = 6
 )
 
 // Palette.
@@ -80,8 +95,6 @@ func init() {
 
 // ───────────────────────── text helpers ─────────────────────────
 
-// setText writes to a TextEdit after converting Unix newlines to the CRLF
-// that Win32 edit controls expect.
 func setText(t *wui.TextEdit, text string) {
 	windowsText := strings.ReplaceAll(text, "\n", "\r\n")
 	t.SetText(windowsText)
@@ -97,6 +110,22 @@ func parseFloat(s string) float64 {
 		return 0
 	}
 	return v
+}
+
+func parseInt(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func fmtFloatShort(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // ───────────────────────── control factories ─────────────────────────
@@ -155,6 +184,28 @@ func newOutput(x, y, w, h int) *wui.TextEdit {
 	return t
 }
 
+// ───────────────────────── layout engine ─────────────────────────
+
+// applyLayout registers a layout function that runs:
+//   - immediately (using the current inner size, or defaults if not yet known)
+//   - on every WM_SIZE (window resize)
+//   - on window show (ensures correct size once the HWND exists)
+func applyLayout(w *wui.Window, fn func(iw, ih int)) {
+	doLayout := func() {
+		iw, ih := w.InnerWidth(), w.InnerHeight()
+		if iw <= 0 {
+			iw = defaultW
+		}
+		if ih <= 0 {
+			ih = defaultH
+		}
+		fn(iw, ih)
+	}
+	w.SetOnResize(doLayout)
+	w.SetOnShow(doLayout)
+	doLayout()
+}
+
 // ───────────────────────── main window ─────────────────────────
 
 func main() { newMainWindow().Show() }
@@ -162,21 +213,24 @@ func main() { newMainWindow().Show() }
 func newMainWindow() *wui.Window {
 	w := wui.NewWindow()
 	w.SetTitle("FLP Studio Tool")
-	w.SetSize(winW, winH)
-	w.SetResizable(false)
+	w.SetSize(defaultW, defaultH)
+	w.SetResizable(true)
 	w.SetBackground(colBG)
-	w.SetHasMinButton(false)
-	w.SetHasMaxButton(false)
+	w.SetHasMinButton(true)
+	w.SetHasMaxButton(true)
 
 	title := wui.NewLabel()
 	title.SetText("FLP Studio Tool")
-	title.SetBounds(20, 10, winW-40, 28)
 	if fontTitle != nil {
 		title.SetFont(fontTitle)
 	}
 	w.Add(title)
 
-	w.Add(newLabel("Tools for FL Studio .flp project files", 20, 42, winW-40, 18))
+	subtitle := newLabel("Tools for FL Studio .flp project files", 0, 0, 100, labelH)
+	w.Add(subtitle)
+
+	verLabel := newLabel("Version "+version, 0, 0, 100, labelH)
+	w.Add(verLabel)
 
 	tools := []struct {
 		label string
@@ -193,23 +247,63 @@ func newMainWindow() *wui.Window {
 		{"About", openAboutTool},
 	}
 
-	const (
-		btnW = 292
-		btnH = 46
-		gapX = 8
-		gapY = 6
-		colX = 16
-		rowY = 68
-	)
+	const cols = 2
+	btns := make([]*wui.Button, len(tools))
 	for i, t := range tools {
-		row, col := i/2, i%2
 		open := t.open
-		b := newBtn(t.label, colX+col*(btnW+gapX), rowY+row*(btnH+gapY), btnW, btnH,
-			func() { open(w) })
+		b := newBtn(t.label, 0, 0, 100, 40, func() { open(w) })
 		w.Add(b)
+		btns[i] = b
 	}
 
-	w.Add(newLabel("Version "+version, 20, winH-40, winW-40, 20))
+	applyLayout(w, func(iw, ih int) {
+		title.SetBounds(margin, 12, iw-2*margin, 30)
+		subtitle.SetBounds(margin, 46, iw-2*margin, labelH)
+
+		const headerH = 78
+		const footerH = 30
+		const gapX = 10
+		const gapY = 8
+		rows := (len(tools) + cols - 1) / cols
+
+		gridTop := headerH
+		gridH := ih - footerH - gridTop
+		if gridH < 60 {
+			gridH = 60
+		}
+
+		cellW := (iw - 2*margin - (cols-1)*gapX) / cols
+		cellH := (gridH - (rows-1)*gapY) / rows
+		if cellW > 340 {
+			cellW = 340
+		}
+		if cellH > 66 {
+			cellH = 66
+		}
+		if cellW < 100 {
+			cellW = 100
+		}
+		if cellH < 30 {
+			cellH = 30
+		}
+
+		totalW := cellW*cols + (cols-1)*gapX
+		totalH := cellH*rows + (rows-1)*gapY
+		startX := (iw - totalW) / 2
+		startY := gridTop + (gridH-totalH)/2
+		if startY < gridTop {
+			startY = gridTop
+		}
+
+		for i := range btns {
+			r := i / cols
+			c := i % cols
+			btns[i].SetBounds(startX+c*(cellW+gapX), startY+r*(cellH+gapY), cellW, cellH)
+		}
+
+		verLabel.SetBounds(margin, ih-footerH+6, iw-2*margin, labelH)
+	})
+
 	return w
 }
 
@@ -218,11 +312,11 @@ func newMainWindow() *wui.Window {
 func newModal(title string) *wui.Window {
 	w := wui.NewWindow()
 	w.SetTitle(title)
-	w.SetSize(winW, winH)
-	w.SetResizable(false)
+	w.SetSize(defaultW, defaultH)
+	w.SetResizable(true)
 	w.SetBackground(colBG)
-	w.SetHasMinButton(false)
-	w.SetHasMaxButton(false)
+	w.SetHasMinButton(true)
+	w.SetHasMaxButton(true)
 	return w
 }
 
@@ -232,23 +326,41 @@ func showModal(w *wui.Window) {
 	}
 }
 
-func fileRow(w *wui.Window, y int, title string) *wui.EditLine {
-	w.Add(newLabel("File:", 12, y+4, 50, 20))
-	ed := newEdit(66, y, 430, 24)
+// fileRowUI is a reusable "File: [edit] [Browse...]" row that knows how to
+// lay itself out.
+type fileRowUI struct {
+	label *wui.Label
+	edit  *wui.EditLine
+	btn   *wui.Button
+}
+
+func newFileRowUI(w *wui.Window, labelText, dlgTitle string) *fileRowUI {
+	lbl := newLabel(labelText, 0, 0, fileLabelW, labelH)
+	w.Add(lbl)
+	ed := newEdit(0, 0, 100, editH)
 	w.Add(ed)
-	btn := newBtn("Browse...", 502, y, 106, 24, nil)
+	btn := newBtn("Browse...", 0, 0, fileBtnW, editH, nil)
 	btn.SetOnClick(func() {
-		if p := browseFLP(w, title); p != "" {
+		if p := browseFLP(w, dlgTitle); p != "" {
 			ed.SetText(p)
 		}
 	})
 	w.Add(btn)
-	return ed
+	return &fileRowUI{lbl, ed, btn}
 }
 
-func closeButton(w *wui.Window) *wui.Button {
-	return newBtn("Close", 502, winH-56, 106, 26, func() { w.Close() })
+func (fr *fileRowUI) layout(x, y, width int) {
+	fr.label.SetBounds(x, y+3, fileLabelW, labelH)
+	editW := width - fileLabelW - fileBtnW - rowInnerGap
+	if editW < 80 {
+		editW = 80
+	}
+	fr.edit.SetBounds(x+fileLabelW, y, editW, editH)
+	fr.btn.SetBounds(x+fileLabelW+editW+rowInnerGap, y, fileBtnW, editH)
 }
+
+func (fr *fileRowUI) text() string { return fr.edit.Text() }
+func (fr *fileRowUI) setText(s string) { fr.edit.SetText(s) }
 
 func browseFLP(parent *wui.Window, title string) string {
 	dlg := wui.NewFileOpenDialog()
@@ -272,6 +384,100 @@ func browseSave(parent *wui.Window, title string) string {
 		return ""
 	}
 	return path
+}
+
+func browseSaveMIDI(parent *wui.Window, title string) string {
+	dlg := wui.NewFileSaveDialog()
+	dlg.SetTitle(title)
+	dlg.AddFilter("MIDI file (*.mid)", "mid")
+	dlg.AddFilter("All files", "*.*")
+	ok, path := dlg.Execute(parent)
+	if !ok {
+		return ""
+	}
+	return path
+}
+
+
+// exportPatternMIDI writes the notes of one FLP pattern to a Standard MIDI File.
+// Each distinct FLP channel is mapped to a sequential MIDI channel (0–15).
+func exportPatternMIDI(p *flp.FLPProject, patternIdx int, path string) error {
+	if p == nil {
+		return fmt.Errorf("no project loaded")
+	}
+	if patternIdx < 0 || patternIdx >= len(p.Patterns) {
+		return fmt.Errorf("pattern index out of range")
+	}
+	pat := p.Patterns[patternIdx]
+
+	ppq := uint16(96)
+	if p.Header.PPQ > 0 {
+		ppq = uint16(p.Header.PPQ)
+	}
+	clock := smf.MetricTicks(ppq)
+
+	// Map each FLP channel IID to a distinct MIDI channel (0–15).
+	channelMap := make(map[int]uint8)
+	nextCh := uint8(0)
+	for _, n := range pat.Notes {
+		if _, ok := channelMap[n.ChannelIid]; !ok {
+			channelMap[n.ChannelIid] = nextCh
+			nextCh = (nextCh + 1) % 16
+		}
+	}
+
+	type midiEvent struct {
+		tick int64
+		msg  midi.Message
+	}
+	events := make([]midiEvent, 0, len(pat.Notes)*2)
+
+	for _, n := range pat.Notes {
+		ch := channelMap[n.ChannelIid]
+		vel := uint8(n.Velocity)
+		if vel == 0 {
+			vel = 100
+		}
+		events = append(events, midiEvent{
+			tick: int64(n.Position),
+			msg:  midi.NoteOn(ch, uint8(n.Key), vel),
+		})
+		events = append(events, midiEvent{
+			tick: int64(n.Position + n.Length),
+			msg:  midi.NoteOff(ch, uint8(n.Key)),
+		})
+	}
+
+	// Sort by absolute tick position; NoteOff at the same tick as a NoteOn
+	// is fine — MIDI players handle same-tick ordering.
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].tick < events[j].tick
+	})
+
+	var tr smf.Track
+	var lastTick int64
+	for _, ev := range events {
+		delta := ev.tick - lastTick
+		if delta < 0 {
+			delta = 0
+		}
+		tr.Add(uint32(delta), ev.msg)
+		lastTick = ev.tick
+	}
+	tr.Close(0) // EndOfTrack meta event
+
+	s := smf.New()
+	s.TimeFormat = clock
+	s.Add(tr)
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = s.WriteTo(f)
+	return err
 }
 
 func loadProject(path string) (*flp.FLPProject, error) {
@@ -314,22 +520,48 @@ func trimForUI(s string) string {
 func openDiffTool(_ *wui.Window) {
 	w := newModal("Diff Two Projects")
 
-	edA := fileRow(w, 12, "Select project A")
-	edB := fileRow(w, 42, "Select project B")
+	frA := newFileRowUI(w, "File A:", "Select project A")
+	frB := newFileRowUI(w, "File B:", "Select project B")
 
-	btnDiff := newBtn("Diff", 12, 74, 100, 26, nil)
+	btnDiff := newBtn("Diff", 0, 0, 100, btnH, nil)
 	w.Add(btnDiff)
-	btnVerbose := newBtn("Verbose", 118, 74, 100, 26, nil)
+	btnVerbose := newBtn("Verbose", 0, 0, 100, btnH, nil)
 	w.Add(btnVerbose)
-	btnClear := newBtn("Clear", 224, 74, 100, 26, nil)
+	btnClear := newBtn("Clear", 0, 0, 100, btnH, nil)
 	w.Add(btnClear)
 
-	out := newOutput(12, 108, winW-40, winH-190)
+	out := newOutput(0, 0, 100, 100)
 	setText(out, "Pick two .flp files and press Diff or Verbose.")
 	w.Add(out)
 
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+		frA.layout(margin, y, contentW)
+		y += editH + rowGap
+		frB.layout(margin, y, contentW)
+		y += editH + rowGap + 6
+
+		btnDiff.SetBounds(margin, y, 100, btnH)
+		btnVerbose.SetBounds(margin+108, y, 100, btnH)
+		btnClear.SetBounds(margin+216, y, 100, btnH)
+		y += btnH + rowGap + 6
+
+		bottomH := btnH + margin
+		outH := ih - y - bottomH
+		if outH < 80 {
+			outH = 80
+		}
+		out.SetBounds(margin, y, contentW, outH)
+
+		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
+
 	run := func(verbose bool) {
-		a, b := edA.Text(), edB.Text()
+		a, b := frA.text(), frB.text()
 		if a == "" || b == "" {
 			setText(out, "Error: both File A and File B must be set.")
 			return
@@ -356,13 +588,11 @@ func openDiffTool(_ *wui.Window) {
 	btnVerbose.SetOnClick(func() { run(true) })
 	btnClear.SetOnClick(func() { setText(out, "") })
 
-	w.Add(closeButton(w))
 	showModal(w)
 }
 
 // ───────────────────────── 2. Edit & Save ─────────────────────────
 
-// editSession holds the in-memory project being edited and its paths.
 type editSession struct {
 	project  *flp.FLPProject
 	original *flp.FLPProject
@@ -370,17 +600,11 @@ type editSession struct {
 	saveAs   string
 }
 
-// propField is one label+edit pair in the properties panel.
 type propField struct {
 	label *wui.Label
 	edit  *wui.EditLine
 }
 
-// categoryDef describes one editable category.
-//   - list(p)  → labels shown in the middle column
-//   - read(p,i) → current values for item i, in the order of `props`
-//   - apply(p,i,vals) → returns a new project with the values written
-//   - msg(i,vals) → one-line log/status message
 type categoryDef struct {
 	label string
 	list  func(*flp.FLPProject) []string
@@ -388,24 +612,6 @@ type categoryDef struct {
 	props []string
 	apply func(*flp.FLPProject, int, []string) (*flp.FLPProject, error)
 	msg   func(int, []string) string
-}
-
-// ── string / value helpers ──
-
-func parseInt(s string) int {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return v
-}
-
-func fmtFloatShort(v float64) string {
-	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 func colorStrings(c *flp.RGBA) []string {
@@ -425,7 +631,6 @@ func parseColorStrings(vals []string) flp.MutRGBA {
 	return flp.MutRGBA{R: get(0), G: get(1), B: get(2), A: get(3)}
 }
 
-// arrTrackAt flattens "track k across all arrangements" back to (arrIdx, trackIdx).
 func arrTrackAt(p *flp.FLPProject, i int) (int, int, bool) {
 	n := 0
 	for ai, a := range p.Arrangements {
@@ -438,8 +643,6 @@ func arrTrackAt(p *flp.FLPProject, i int) (int, int, bool) {
 	}
 	return 0, 0, false
 }
-
-// ── the category table ──
 
 var editCategories = []categoryDef{
 	{
@@ -632,7 +835,6 @@ var editCategories = []categoryDef{
 			idx := p.Inserts[i].Index
 			cur := p
 			var err error
-			// SetInsertName accepts empty string (clears the name).
 			if cur, err = flp.SetInsertName(cur, idx, v[0]); err != nil {
 				return nil, err
 			}
@@ -744,82 +946,158 @@ var editCategories = []categoryDef{
 	},
 }
 
-// ── the modal itself ──
-
 func openEditTool(_ *wui.Window) {
 	w := newModal("Edit Project")
 
-	// ── File row (custom: File + Browse + Load) ──
-	w.Add(newLabel("File:", 12, 10, 50, 20))
-	edSrc := newEdit(66, 6, 320, 24)
+	// ── File / Save rows ──
+	lblFile := newLabel("Open:", 0, 0, 60, labelH)
+	w.Add(lblFile)
+	edSrc := newEdit(0, 0, 100, editH)
 	w.Add(edSrc)
-	btnBrowse := newBtn("Browse", 392, 6, 90, 24, nil)
+	btnBrowse := newBtn("Browse", 0, 0, 90, editH, nil)
 	w.Add(btnBrowse)
-	btnLoad := newBtn("Load", 488, 6, 120, 24, nil)
+	btnLoad := newBtn("Load", 0, 0, 90, editH, nil)
 	w.Add(btnLoad)
 
-	// ── Save row (Save to + Browse + Save) ──
-	w.Add(newLabel("Save to:", 12, 40, 50, 20))
-	edDst := newEdit(66, 36, 320, 24)
+	lblSave := newLabel("Save as:", 0, 0, 60, labelH)
+	w.Add(lblSave)
+	edDst := newEdit(0, 0, 100, editH)
 	w.Add(edDst)
-	btnDstBrowse := newBtn("Browse", 392, 36, 90, 24, nil)
+	btnDstBrowse := newBtn("Browse", 0, 0, 90, editH, nil)
 	w.Add(btnDstBrowse)
-	btnSave := newBtn("Save", 488, 36, 120, 24, nil)
+	btnSave := newBtn("Save", 0, 0, 90, editH, nil)
 	w.Add(btnSave)
 
 	// ── Column headers ──
-	w.Add(newLabel("Category", 12, 66, 130, 16))
-	w.Add(newLabel("Item", 150, 66, 170, 16))
-	w.Add(newLabel("Properties", 326, 66, 300, 16))
+	lblCatH := newLabel("Category", 0, 0, 100, 16)
+	w.Add(lblCatH)
+	lblItemH := newLabel("Item", 0, 0, 100, 16)
+	w.Add(lblItemH)
+	lblPropH := newLabel("Properties", 0, 0, 100, 16)
+	w.Add(lblPropH)
 
-	// ── Three-column split ──
-	const splitY = 84
-	const splitH = 256 // 8 rows × 32 px
-
+	// ── Three column lists ──
 	catList := wui.NewStringList()
-	catList.SetBounds(8, splitY, 138, splitH)
 	if fontNormal != nil {
 		catList.SetFont(fontNormal)
 	}
 	w.Add(catList)
 
 	itemList := wui.NewStringList()
-	itemList.SetBounds(150, splitY, 168, splitH)
 	if fontNormal != nil {
 		itemList.SetFont(fontNormal)
 	}
 	w.Add(itemList)
 
-	// ── Property panel (up to 8 rows of 32 px) ──
-	const propX = 326
-	const propW = 306
-	const rowH = 32
-	fields := make([]propField, 8)
+	// ── Property panel ──
+	const maxFields = 8
+	fields := make([]propField, maxFields)
 	for i := range fields {
-		y := splitY + i*rowH
-		lbl := newLabel("", propX, y+6, 100, 20)
-		ed := newEdit(propX+104, y+2, propW-104, 24)
+		lbl := newLabel("", 0, 0, 100, labelH)
+		ed := newEdit(0, 0, 100, editH)
 		w.Add(lbl)
 		w.Add(ed)
 		fields[i] = propField{lbl, ed}
 	}
 
-	// ── Status bar + Revert / Apply ──
-	status := newLabel("Load an .flp to begin.", 12, winH-60, 300, 20)
+	// ── Status bar + buttons ──
+	status := newLabel("Load an .flp to begin.", 0, 0, 100, labelH)
 	w.Add(status)
-	btnRevert := newBtn("Revert", 318, winH-62, 90, 26, nil)
+	btnRevert := newBtn("Revert", 0, 0, 90, btnH, nil)
 	w.Add(btnRevert)
-	btnApply := newBtn("Apply", 414, winH-62, 90, 26, nil)
+	btnApply := newBtn("Apply", 0, 0, 90, btnH, nil)
 	w.Add(btnApply)
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
 
-	w.Add(closeButton(w))
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+
+		const lblW = 60
+		const bw = 90
+
+		// Row 1: Open
+		lblFile.SetBounds(margin, y+3, lblW, labelH)
+		editW := contentW - lblW - 2*bw - 2*rowInnerGap
+		if editW < 80 {
+			editW = 80
+		}
+		edSrc.SetBounds(margin+lblW, y, editW, editH)
+		btnBrowse.SetBounds(margin+lblW+editW+rowInnerGap, y, bw, editH)
+		btnLoad.SetBounds(margin+lblW+editW+rowInnerGap+bw+rowInnerGap, y, bw, editH)
+		y += editH + rowGap
+
+		// Row 2: Save as
+		lblSave.SetBounds(margin, y+3, lblW, labelH)
+		edDst.SetBounds(margin+lblW, y, editW, editH)
+		btnDstBrowse.SetBounds(margin+lblW+editW+rowInnerGap, y, bw, editH)
+		btnSave.SetBounds(margin+lblW+editW+rowInnerGap+bw+rowInnerGap, y, bw, editH)
+		y += editH + rowGap + 6
+
+		// Bottom bar reserve
+		bottomH := btnH + 2*margin
+		contentBottom := ih - bottomH
+
+		// Column headers
+		headerY := y
+		y += 18
+
+		contentH := contentBottom - y
+		if contentH < 80 {
+			contentH = 80
+		}
+
+		const gap = 6
+		availW := contentW - 2*gap
+		catW := availW * 24 / 100
+		itemW := availW * 30 / 100
+		propW := availW - catW - itemW
+
+		catX := margin
+		itemX := catX + catW + gap
+		propX := itemX + itemW + gap
+
+		lblCatH.SetBounds(catX, headerY, catW, 16)
+		lblItemH.SetBounds(itemX, headerY, itemW, 16)
+		lblPropH.SetBounds(propX, headerY, propW, 16)
+
+		catList.SetBounds(catX, y, catW, contentH)
+		itemList.SetBounds(itemX, y, itemW, contentH)
+
+		// 8 property rows filling the column height.
+		fieldH := contentH / maxFields
+		if fieldH < 26 {
+			fieldH = 26
+		}
+		if fieldH > 40 {
+			fieldH = 40
+		}
+		const propLabelW = 100
+		for i, f := range fields {
+			fy := y + i*fieldH
+			f.label.SetBounds(propX, fy+4, propLabelW, fieldH-8)
+			f.edit.SetBounds(propX+propLabelW+4, fy+2, propW-propLabelW-4, fieldH-4)
+		}
+
+		// Bottom bar (right-aligned buttons).
+		barY := ih - margin - btnH
+		btnClose.SetBounds(iw-margin-closeBtnW, barY, closeBtnW, btnH)
+		btnApply.SetBounds(iw-margin-closeBtnW-rowInnerGap-90, barY, 90, btnH)
+		btnRevert.SetBounds(iw-margin-closeBtnW-rowInnerGap-90-rowInnerGap-90, barY, 90, btnH)
+		statusX := margin
+		statusW := iw - margin - closeBtnW - rowInnerGap - 90 - rowInnerGap - 90 - rowInnerGap - margin
+		if statusW < 60 {
+			statusW = 60
+		}
+		status.SetBounds(statusX, barY+3, statusW, labelH)
+	})
 
 	// ── Session state ──
 	session := &editSession{}
 	catIndex := 0
 	itemIndex := 0
 
-	// ── Panel helpers ──
 	clearFields := func() {
 		for i := range fields {
 			fields[i].label.SetText("")
@@ -894,7 +1172,6 @@ func openEditTool(_ *wui.Window) {
 			mod))
 	}
 
-	// ── Category list ──
 	catLabels := make([]string, len(editCategories))
 	for i, c := range editCategories {
 		catLabels[i] = c.label
@@ -910,7 +1187,6 @@ func openEditTool(_ *wui.Window) {
 		refreshItems()
 	})
 
-	// ── Item list ──
 	itemList.SetOnChange(func(i int) {
 		if i < 0 || catIndex < 0 || catIndex >= len(editCategories) {
 			return
@@ -919,7 +1195,6 @@ func openEditTool(_ *wui.Window) {
 		populateFields(editCategories[catIndex], i)
 	})
 
-	// ── Load ──
 	btnBrowse.SetOnClick(func() {
 		if p := browseFLP(w, "Open FL Studio project"); p != "" {
 			edSrc.SetText(p)
@@ -950,7 +1225,6 @@ func openEditTool(_ *wui.Window) {
 		updateStatus()
 	})
 
-	// ── Save ──
 	doSave := func(path string) {
 		if session.project == nil {
 			status.SetText("No project to save.")
@@ -988,7 +1262,6 @@ func openEditTool(_ *wui.Window) {
 		doSave(p)
 	})
 
-	// ── Apply ──
 	btnApply.SetOnClick(func() {
 		if session.project == nil {
 			status.SetText("No project loaded.")
@@ -1000,7 +1273,7 @@ func openEditTool(_ *wui.Window) {
 		if itemIndex < 0 {
 			status.SetText("No item selected.")
 			return
-		}
+			}
 		cat := editCategories[catIndex]
 		vals := readFields(cat)
 		next, err := cat.apply(session.project, itemIndex, vals)
@@ -1014,7 +1287,6 @@ func openEditTool(_ *wui.Window) {
 		updateStatus()
 	})
 
-	// ── Revert ──
 	btnRevert.SetOnClick(func() {
 		if session.original == nil {
 			status.SetText("Nothing loaded to revert to.")
@@ -1034,23 +1306,49 @@ func openEditTool(_ *wui.Window) {
 func openInspectTool(_ *wui.Window) {
 	w := newModal("Inspect Project")
 
-	ed := fileRow(w, 12, "Select a project")
+	fr := newFileRowUI(w, "File:", "Select a project")
 
-	w.Add(newLabel("Format:", 12, 48, 60, 20))
-	cmb := newCombo([]string{"text", "canonical", "json"}, 76, 46, 140, 24)
+	lblFmt := newLabel("Format:", 0, 0, 60, labelH)
+	w.Add(lblFmt)
+	cmb := newCombo([]string{"text", "canonical", "json"}, 0, 0, 140, editH)
 	w.Add(cmb)
 
-	btnShow := newBtn("Show", 224, 45, 100, 26, nil)
+	btnShow := newBtn("Show", 0, 0, 100, btnH, nil)
 	w.Add(btnShow)
-	btnClear := newBtn("Clear", 330, 45, 100, 26, nil)
+	btnClear := newBtn("Clear", 0, 0, 100, btnH, nil)
 	w.Add(btnClear)
 
-	out := newOutput(12, 80, winW-40, winH-162)
+	out := newOutput(0, 0, 100, 100)
 	setText(out, "Pick a project file and press Show.")
 	w.Add(out)
 
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+		fr.layout(margin, y, contentW)
+		y += editH + rowGap
+
+		lblFmt.SetBounds(margin, y+3, 60, labelH)
+		cmb.SetBounds(margin+60, y, 140, editH)
+		btnShow.SetBounds(margin+60+140+rowGap, y-1, 100, btnH)
+		btnClear.SetBounds(margin+60+140+rowGap+108, y-1, 100, btnH)
+		y += editH + rowGap + 6
+
+		bottomH := btnH + margin
+		outH := ih - y - bottomH
+		if outH < 80 {
+			outH = 80
+		}
+		out.SetBounds(margin, y, contentW, outH)
+
+		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
+
 	btnShow.SetOnClick(func() {
-		path := ed.Text()
+		path := fr.text()
 		if path == "" {
 			setText(out, "Error: pick a file to inspect.")
 			return
@@ -1076,7 +1374,6 @@ func openInspectTool(_ *wui.Window) {
 	})
 	btnClear.SetOnClick(func() { setText(out, "") })
 
-	w.Add(closeButton(w))
 	showModal(w)
 }
 
@@ -1094,7 +1391,6 @@ type vizState struct {
 
 	zoomX, zoomY float64
 
-	// Drag state: 0 none, 1 v-scrollbar, 2 h-scrollbar
 	dragMode         int
 	dragStartX       int
 	dragStartY       int
@@ -1108,32 +1404,37 @@ func openVisualizerTool(_ *wui.Window) {
 	w := newModal("Visualize Project")
 	w.SetBackground(colCanvasBG)
 
-	ed := fileRow(w, 12, "Select a project")
+	fr := newFileRowUI(w, "File:", "Select a project")
 
-	// ── Toolbar row ──
-	w.Add(newLabel("View:", 12, 50, 36, 20))
-	cmb := newCombo([]string{"arrangement", "pianoroll", "channels", "patterns", "mixer"}, 50, 46, 110, 24)
+	lblView := newLabel("View:", 0, 0, 40, labelH)
+	w.Add(lblView)
+	cmb := newCombo([]string{"arrangement", "pianoroll", "channels", "patterns", "mixer"}, 0, 0, 110, editH)
 	w.Add(cmb)
 
-	w.Add(newLabel("Pattern:", 166, 50, 56, 20))
-	patCmb := newCombo([]string{"(load a project)"}, 224, 46, 160, 24)
+	lblPat := newLabel("Pattern:", 0, 0, 56, labelH)
+	w.Add(lblPat)
+	patCmb := newCombo([]string{"(load a project)"}, 0, 0, 160, editH)
 	w.Add(patCmb)
 
-	w.Add(newLabel("Zoom:", 390, 50, 40, 20))
-	btnZoomOut := newBtn("−", 432, 46, 26, 24, nil)
+	lblZoom := newLabel("Zoom:", 0, 0, 44, labelH)
+	w.Add(lblZoom)
+	btnZoomOut := newBtn("−", 0, 0, 28, editH, nil)
 	w.Add(btnZoomOut)
-	btnZoomIn := newBtn("+", 460, 46, 26, 24, nil)
+	btnZoomIn := newBtn("+", 0, 0, 28, editH, nil)
 	w.Add(btnZoomIn)
-	btnFit := newBtn("Fit", 488, 46, 36, 24, nil)
+	btnFit := newBtn("Fit", 0, 0, 40, editH, nil)
 	w.Add(btnFit)
-
-	btnRender := newBtn("Render", 528, 46, 100, 24, nil)
+	btnRender := newBtn("Render", 0, 0, 90, editH, nil)
 	w.Add(btnRender)
 
-	// ── Canvas ──
+	btnExportMIDI := newBtn("Export MIDI", 0, 0, 90, editH, nil)
+	w.Add(btnExportMIDI)
+
 	pb := wui.NewPaintBox()
-	pb.SetBounds(12, 80, winW-24, winH-152)
 	w.Add(pb)
+
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
 
 	s := &vizState{
 		view:       "arrangement",
@@ -1141,6 +1442,55 @@ func openVisualizerTool(_ *wui.Window) {
 		zoomY:      1,
 		patternIdx: 0,
 	}
+
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+		fr.layout(margin, y, contentW)
+		y += editH + rowGap
+
+		x := margin
+		lblView.SetBounds(x, y+3, 40, labelH)
+		x += 40
+		viewW := 110
+		cmb.SetBounds(x, y, viewW, editH)
+		x += viewW + 10
+
+		lblPat.SetBounds(x, y+3, 56, labelH)
+		x += 56
+
+		// Right-aligned cluster: Render / Export MIDI / Fit / + / - / Zoom label
+		right := margin + contentW
+		btnRender.SetBounds(right-90, y, 90, editH)
+		right -= 90 + 8
+		btnExportMIDI.SetBounds(right-90, y, 90, editH)
+		right -= 90 + 8
+		btnFit.SetBounds(right-40, y, 40, editH)
+		right -= 40 + 6
+		btnZoomIn.SetBounds(right-28, y, 28, editH)
+		right -= 28 + 4
+		btnZoomOut.SetBounds(right-28, y, 28, editH)
+		right -= 28 + 8
+		lblZoom.SetBounds(right-44, y+3, 44, labelH)
+		right -= 44 + 10
+
+		patW := right - x
+		if patW < 100 {
+			patW = 100
+		}
+		patCmb.SetBounds(x, y, patW, editH)
+
+		y += editH + rowGap + 6
+
+		bottomH := btnH + margin
+		pbH := ih - y - bottomH
+		if pbH < 80 {
+			pbH = 80
+		}
+		pb.SetBounds(margin, y, contentW, pbH)
+
+		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
 
 	pb.SetOnPaint(func(c *wui.Canvas) {
 		s.pbW, s.pbH = c.Size()
@@ -1154,7 +1504,7 @@ func openVisualizerTool(_ *wui.Window) {
 	})
 
 	btnRender.SetOnClick(func() {
-		path := ed.Text()
+		path := fr.text()
 		if path == "" {
 			return
 		}
@@ -1162,9 +1512,6 @@ func openVisualizerTool(_ *wui.Window) {
 		if err != nil {
 			s.project = nil
 			s.source = path
-			s.pbW, s.pbH = winW-24, winH-152
-			s.contentH = 0
-			s.contentW = 0
 			pb.Paint()
 			return
 		}
@@ -1245,7 +1592,6 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	})
 
-	// Wheel: vertical scroll
 	w.SetOnMouseWheel(func(x, y int, delta float64) {
 		if s.project == nil {
 			return
@@ -1262,8 +1608,27 @@ func openVisualizerTool(_ *wui.Window) {
 		clampScroll(s)
 		pb.Paint()
 	})
+	
+	btnExportMIDI.SetOnClick(func() {
+		if s.project == nil {
+			wui.MessageBoxInfo("Export MIDI", "No project loaded.")
+			return
+		}
+		if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+			wui.MessageBoxInfo("Export MIDI", "No pattern selected.")
+			return
+		}
+		path := browseSaveMIDI(w, "Export pattern as MIDI")
+		if path == "" {
+			return
+		}
+		if err := exportPatternMIDI(s.project, s.patternIdx, path); err != nil {
+			wui.MessageBoxError("Export MIDI", "Failed to export:\n"+err.Error())
+			return
+		}
+		wui.MessageBoxInfo("Export MIDI", "Exported pattern to:\n"+path)
+	})
 
-	// Keyboard nav + zoom
 	w.SetOnKeyDown(func(key int) {
 		if s.project == nil {
 			return
@@ -1304,13 +1669,14 @@ func openVisualizerTool(_ *wui.Window) {
 		pb.Paint()
 	})
 
-	// Mouse: scrollbar drag
-	const pbX, pbY = 12, 80
+	// Mouse: scrollbar drag. Use paintbox's actual position so this keeps
+	// working after the modal is resized.
 	w.SetOnMouseDown(func(_ wui.MouseButton, x, y int) {
 		if s.project == nil {
 			return
 		}
-		lx, ly := x-pbX, y-pbY
+		px, py := pb.Position()
+		lx, ly := x-px, y-py
 		if handleScrollClick(s, lx, ly) {
 			pb.Paint()
 		}
@@ -1327,7 +1693,6 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	})
 
-	w.Add(closeButton(w))
 	showModal(w)
 }
 
@@ -1424,7 +1789,6 @@ func hThumb(s *vizState) (pos, size int) {
 }
 
 func handleScrollClick(s *vizState, lx, ly int) bool {
-	// Vertical scrollbar
 	vx := s.pbW - scrollbarSize
 	if lx >= vx && lx < s.pbW && ly >= vizHeaderH && ly < s.pbH-scrollbarSize {
 		pos, size := vThumb(s)
@@ -1443,7 +1807,6 @@ func handleScrollClick(s *vizState, lx, ly int) bool {
 		}
 		return true
 	}
-	// Horizontal scrollbar
 	hy := s.pbH - scrollbarSize
 	if ly >= hy && ly < s.pbH && lx >= 0 && lx < s.pbW-scrollbarSize {
 		pos, size := hThumb(s)
@@ -1609,7 +1972,6 @@ func renderViz(c *wui.Canvas, s *vizState) {
 	s.contentW, s.contentH = measureContent(s)
 	clampScroll(s)
 
-	// Clipped content area
 	c.PushDrawRegion(0, vizHeaderH, vpW, vpH)
 	switch s.view {
 	case "channels":
@@ -1629,7 +1991,6 @@ func renderViz(c *wui.Canvas, s *vizState) {
 }
 
 func drawScrollbars(c *wui.Canvas, w, h int, s *vizState) {
-	// Vertical track
 	trackX := w - scrollbarSize
 	trackY := vizHeaderH
 	trackH := h - vizHeaderH - scrollbarSize
@@ -1639,7 +2000,6 @@ func drawScrollbars(c *wui.Canvas, w, h int, s *vizState) {
 		c.FillRect(trackX+2, trackY+pos, scrollbarSize-4, size, colThumb)
 	}
 
-	// Horizontal track
 	hTrackY := h - scrollbarSize
 	hTrackW := w - scrollbarSize
 	c.FillRect(0, hTrackY, hTrackW, scrollbarSize, colTrack)
@@ -1648,11 +2008,8 @@ func drawScrollbars(c *wui.Canvas, w, h int, s *vizState) {
 		c.FillRect(pos+2, hTrackY+2, size-4, scrollbarSize-4, colThumb)
 	}
 
-	// Corner
 	c.FillRect(trackX, hTrackY, scrollbarSize, scrollbarSize, colHeader)
 }
-
-// ── Arrangement ──
 
 func drawArrangementView(c *wui.Canvas, s *vizState) {
 	p := s.project
@@ -1684,7 +2041,6 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 		c.Line(bx, contentY+rulerH-6, bx, contentY+rulerH, colTextDim)
 		c.TextOut(bx+3, contentY+3, fmt.Sprintf("%d", bar+1), colHeaderDi)
 	}
-	// Corner
 	c.FillRect(0, contentY, trackHdrW, rulerH, colHeader)
 
 	// Column backgrounds
@@ -1693,7 +2049,6 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 
 	cy := contentY + rulerH - s.scrollY
 	for _, a := range p.Arrangements {
-		// Arrangement header row
 		if cy+22 > contentY+rulerH && cy < contentY+s.vpH {
 			c.FillRect(0, cy, trackHdrW, 22, colHeader)
 			arrName := fmt.Sprintf("#%d", a.ID)
@@ -1729,7 +2084,6 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 					bg = colTrackAlt
 				}
 
-				// Track header (with FLP track color stripe, if any)
 				c.FillRect(0, cy, trackHdrW, trackH, bg)
 				if t < len(a.Tracks) {
 					if tc, ok := rgbaToWuiColor(a.Tracks[t].Color); ok {
@@ -1745,10 +2099,8 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 				c.TextOut(8, cy+(trackH-14)/2, truncate(label, 20), colTextDim)
 				c.Line(0, cy+trackH-1, trackHdrW, cy+trackH-1, colCanvasBG)
 
-				// Timeline row
 				c.FillRect(trackHdrW, cy, s.vpW-trackHdrW, trackH, bg)
 
-				// Bar grid
 				for bar := startBar; bar <= endBar; bar++ {
 					bx := trackHdrW + int(float64(bar)*barTicks*pxPerTick) - s.scrollX
 					if bx < trackHdrW || bx > s.vpW {
@@ -1758,7 +2110,6 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 				}
 				c.Line(trackHdrW, cy+trackH-1, s.vpW, cy+trackH-1, colCanvasBG)
 
-				// Clips
 				for _, cl := range byTrack[t] {
 					cx := trackHdrW + int(float64(cl.Position)*pxPerTick) - s.scrollX
 					cw := int(float64(cl.Length) * pxPerTick)
@@ -1787,8 +2138,6 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 		cy += 10
 	}
 }
-
-// ── Piano roll ──
 
 func drawPianoRoll(c *wui.Canvas, s *vizState) {
 	p := s.project
@@ -1820,7 +2169,6 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 	gridTop := contentY + rulerH
 	gridBottom := contentY + s.vpH
 
-	// Ruler
 	c.FillRect(pianoKeysW, contentY, s.vpW-pianoKeysW, rulerH, colHeader)
 	for bar := startBar; bar <= endBar; bar++ {
 		bx := pianoKeysW + int(float64(bar)*barTicks*pxPerTick) - s.scrollX
@@ -1830,14 +2178,11 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		c.Line(bx, contentY+rulerH-6, bx, contentY+rulerH, colTextDim)
 		c.TextOut(bx+3, contentY+3, fmt.Sprintf("%d", bar+1), colHeaderDi)
 	}
-	// Corner (pattern label)
 	c.FillRect(0, contentY, pianoKeysW, rulerH, colHeader)
 
-	// Backgrounds
 	c.FillRect(0, gridTop, pianoKeysW, s.vpH-rulerH, colTrackAlt)
 	c.FillRect(pianoKeysW, gridTop, s.vpW-pianoKeysW, s.vpH-rulerH, colCanvasBG)
 
-	// Piano key rows + grid
 	for k := 127; k >= 0; k-- {
 		y := gridTop + (127-k)*keyH - s.scrollY
 		if y+keyH < gridTop || y > gridBottom {
@@ -1866,7 +2211,6 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		}
 	}
 
-	// Beat grid
 	startBeat := int(startTick/beatTicks) - 1
 	endBeat := int(endTick/beatTicks) + 1
 	for beat := startBeat; beat <= endBeat; beat++ {
@@ -1876,7 +2220,6 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		}
 		c.Line(bx, gridTop, bx, gridBottom, wui.RGB(42, 44, 52))
 	}
-	// Bar grid
 	for bar := startBar; bar <= endBar; bar++ {
 		bx := pianoKeysW + int(float64(bar)*barTicks*pxPerTick) - s.scrollX
 		if bx < pianoKeysW || bx > s.vpW {
@@ -1885,7 +2228,6 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		c.Line(bx, gridTop, bx, gridBottom, wui.RGB(60, 64, 78))
 	}
 
-	// Notes
 	for _, n := range pat.Notes {
 		y := gridTop + (127-int(n.Key))*keyH - s.scrollY
 		if y+keyH < gridTop || y > gridBottom {
@@ -1920,7 +2262,6 @@ func isBlackKey(k int) bool {
 	return false
 }
 
-// noteColor returns the channel's stored color if any, else a kind-based color.
 func noteColor(p *flp.FLPProject, channelIid int) wui.Color {
 	for _, ch := range p.Channels {
 		if ch.Iid == channelIid {
@@ -1932,8 +2273,6 @@ func noteColor(p *flp.FLPProject, channelIid int) wui.Color {
 	}
 	return wui.RGB(150, 150, 150)
 }
-
-// ── Channels / Patterns / Mixer ──
 
 func drawChannelsView(c *wui.Canvas, s *vizState) {
 	p := s.project
@@ -2091,8 +2430,6 @@ func drawMixerView(c *wui.Canvas, s *vizState) {
 	}
 }
 
-// ── Color / text helpers ──
-
 func truncate(s string, n int) string {
 	if n < 3 || len(s) <= n {
 		return s
@@ -2100,8 +2437,6 @@ func truncate(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-// rgbaToWuiColor converts a *flp.RGBA into a wui.Color. The bool is false
-// when the source is nil (no explicit color stored in the FLP).
 func rgbaToWuiColor(c *flp.RGBA) (wui.Color, bool) {
 	if c == nil {
 		return wui.RGB(0, 0, 0), false
@@ -2109,8 +2444,6 @@ func rgbaToWuiColor(c *flp.RGBA) (wui.Color, bool) {
 	return wui.RGB(uint8(c.R), uint8(c.G), uint8(c.B)), true
 }
 
-// channelColor is the fallback kind-based color used when an FLP channel
-// has no explicit color.
 func channelColor(kind string) wui.Color {
 	switch kind {
 	case "sampler":
@@ -2125,8 +2458,6 @@ func channelColor(kind string) wui.Color {
 	return wui.RGB(140, 140, 140)
 }
 
-// patternColor is the deterministic hash-based fallback used when an FLP
-// pattern has no explicit color.
 func patternColor(id int) wui.Color {
 	h := float64(((id*137)%360)+360) / 60.0
 	s := 0.65
@@ -2156,7 +2487,6 @@ func patternColor(id int) wui.Color {
 
 func insColor(idx int) wui.Color { return patternColor(idx + 7) }
 
-// channelColorFor prefers the FLP-stored channel color, else falls back to kind.
 func channelColorFor(p *flp.FLPProject, iid int) wui.Color {
 	for _, ch := range p.Channels {
 		if ch.Iid == iid {
@@ -2169,7 +2499,6 @@ func channelColorFor(p *flp.FLPProject, iid int) wui.Color {
 	return channelColor("instrument")
 }
 
-// patternColorFor prefers the FLP-stored pattern color, else hash fallback.
 func patternColorFor(p *flp.FLPProject, patternID int) wui.Color {
 	for _, pt := range p.Patterns {
 		if pt.ID == patternID {
@@ -2182,7 +2511,6 @@ func patternColorFor(p *flp.FLPProject, patternID int) wui.Color {
 	return patternColor(patternID)
 }
 
-// insertColorFor prefers the FLP-stored insert color, else hash fallback.
 func insertColorFor(p *flp.FLPProject, index int) wui.Color {
 	for _, ins := range p.Inserts {
 		if ins.Index == index {
@@ -2236,25 +2564,58 @@ type browserRow struct {
 func openBrowser(name string, rows func(*flp.FLPProject) []browserRow) {
 	w := newModal(name)
 
-	ed := fileRow(w, 12, "Select a project")
+	fr := newFileRowUI(w, "File:", "Select a project")
 
-	btnLoad := newBtn("Load", 12, 44, 100, 26, nil)
+	btnLoad := newBtn("Load", 0, 0, 100, btnH, nil)
 	w.Add(btnLoad)
 
 	list := wui.NewStringList()
-	list.SetBounds(12, 78, 260, winH-146)
 	if fontNormal != nil {
 		list.SetFont(fontNormal)
 	}
 	w.Add(list)
 
-	det := newOutput(280, 78, winW-292, winH-146)
+	det := newOutput(0, 0, 100, 100)
 	w.Add(det)
+
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+		fr.layout(margin, y, contentW)
+		y += editH + rowGap
+
+		btnLoad.SetBounds(margin, y, 100, btnH)
+		y += btnH + rowGap + 6
+
+		bottomH := btnH + margin
+		contentH := ih - y - bottomH
+		if contentH < 80 {
+			contentH = 80
+		}
+
+		listW := 280
+		if listW > contentW/2 {
+			listW = contentW / 2
+		}
+		if listW < 150 {
+			listW = 150
+		}
+		detX := margin + listW + rowGap
+		detW := contentW - listW - rowGap
+
+		list.SetBounds(margin, y, listW, contentH)
+		det.SetBounds(detX, y, detW, contentH)
+
+		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
 
 	var data []browserRow
 
 	btnLoad.SetOnClick(func() {
-		path := ed.Text()
+		path := fr.text()
 		if path == "" {
 			setText(det, "Error: pick a file to load.")
 			return
@@ -2284,7 +2645,6 @@ func openBrowser(name string, rows func(*flp.FLPProject) []browserRow) {
 		}
 	})
 
-	w.Add(closeButton(w))
 	showModal(w)
 }
 
@@ -2449,18 +2809,44 @@ func openMixerTool(_ *wui.Window) {
 func openGitTool(_ *wui.Window) {
 	w := newModal("Git Integration")
 
-	b1 := newBtn("Setup (local)", 12, 12, 150, 28, nil)
+	b1 := newBtn("Setup (local)", 0, 0, 150, btnH, nil)
 	w.Add(b1)
-	b2 := newBtn("Setup (global)", 170, 12, 150, 28, nil)
+	b2 := newBtn("Setup (global)", 0, 0, 150, btnH, nil)
 	w.Add(b2)
-	b3 := newBtn("Setup (textconv)", 328, 12, 150, 28, nil)
+	b3 := newBtn("Setup (textconv)", 0, 0, 150, btnH, nil)
 	w.Add(b3)
-	b4 := newBtn("Verify", 486, 12, 122, 28, nil)
+	b4 := newBtn("Verify", 0, 0, 122, btnH, nil)
 	w.Add(b4)
 
-	out := newOutput(12, 52, winW-24, winH-124)
+	out := newOutput(0, 0, 100, 100)
 	setText(out, "Choose an action. Setup writes git config for the current repository.")
 	w.Add(out)
+
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+		bw := (contentW - 3*rowInnerGap) / 4
+		if bw < 90 {
+			bw = 90
+		}
+		b1.SetBounds(margin, y, bw, btnH)
+		b2.SetBounds(margin+bw+rowInnerGap, y, bw, btnH)
+		b3.SetBounds(margin+2*(bw+rowInnerGap), y, bw, btnH)
+		b4.SetBounds(margin+3*(bw+rowInnerGap), y, bw, btnH)
+		y += btnH + rowGap + 6
+
+		bottomH := btnH + margin
+		outH := ih - y - bottomH
+		if outH < 80 {
+			outH = 80
+		}
+		out.SetBounds(margin, y, contentW, outH)
+
+		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
 
 	runSetup := func(o flp.SetupOptions) {
 		res, err := flp.SetupGit(o)
@@ -2475,20 +2861,13 @@ func openGitTool(_ *wui.Window) {
 	b3.SetOnClick(func() { runSetup(flp.SetupOptions{Mode: flp.ModeTextconv}) })
 	b4.SetOnClick(func() { setText(out, flp.RenderVerifyReport(flp.VerifyGit(""))) })
 
-	w.Add(closeButton(w))
 	showModal(w)
 }
 
 // ───────────────────────── 9. About ─────────────────────────
 
 func openAboutTool(_ *wui.Window) {
-	w := wui.NewWindow()
-	w.SetTitle("About")
-	w.SetSize(winW, winH)
-	w.SetResizable(false)
-	w.SetBackground(colBG)
-	w.SetHasMinButton(false)
-	w.SetHasMaxButton(false)
+	w := newModal("About")
 
 	lines := []string{
 		"FLP Studio Tool",
@@ -2499,20 +2878,34 @@ func openAboutTool(_ *wui.Window) {
 		"",
 		"Built with the flp library and gonutz/wui.",
 	}
-	y := 24
+	labels := make([]*wui.Label, len(lines))
 	for i, l := range lines {
 		lbl := wui.NewLabel()
 		lbl.SetText(l)
-		lbl.SetBounds(24, y, winW-48, 22)
 		if i == 0 && fontTitle != nil {
 			lbl.SetFont(fontTitle)
 		} else if fontNormal != nil {
 			lbl.SetFont(fontNormal)
 		}
 		w.Add(lbl)
-		y += 24
+		labels[i] = lbl
 	}
 
-	w.Add(newBtn("Close", winW-130, winH-70, 106, 28, func() { w.Close() }))
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	applyLayout(w, func(iw, ih int) {
+		lineH := 24
+		totalH := len(lines) * lineH
+		startY := (ih - totalH) / 2
+		if startY < margin {
+			startY = margin
+		}
+		for i, lbl := range labels {
+			lbl.SetBounds(margin*2, startY+i*lineH, iw-4*margin, lineH)
+		}
+		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
+
 	showModal(w)
 }
