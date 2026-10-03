@@ -2,6 +2,11 @@
 //
 // Features: semantic diff, project inspector, visualiser (with scroll),
 // channel / pattern / mixer browsers, git integration, and an editor.
+//
+// Usage:
+//
+//	flp-gui                 open with no project loaded
+//	flp-gui path/to/x.flp   open with that project preloaded
 package main
 
 import (
@@ -25,7 +30,7 @@ import (
 const (
 	defaultW = 700
 	defaultH = 540
-	version  = "0.3.0 - Professional UI"
+	version  = "v0.0.1"
 
 	vizHeaderH    = 44
 	scrollbarSize = 12
@@ -334,11 +339,31 @@ func trimForUI(s string) string {
 
 // ───────────────────────── main window ─────────────────────────
 
-func main() { newMainWindow().Show() }
+func main() {
+	// CLI: flp-gui <path.flp>  → preload that project.
+	if len(os.Args) > 1 {
+		path := os.Args[1]
+		if path == "-h" || path == "--help" {
+			fmt.Fprintf(os.Stderr, "Usage: %s [path/to/project.flp]\n", filepath.Base(os.Args[0]))
+			os.Exit(0)
+		}
+		p, err := loadProject(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "flp-gui: failed to load %s: %v\n", path, err)
+			// Fall through and show the window anyway so the user can pick a
+			// different file via the GUI.
+		} else {
+			app.Project = p
+			app.Original = p
+			app.Path = path
+		}
+	}
+	newMainWindow().Show()
+}
 
 func newMainWindow() *wui.Window {
 	w := wui.NewWindow()
-	w.SetTitle("FLP Studio Tool - Professional")
+	w.SetTitle("FLP (FL Studio Project) Tool")
 	w.SetSize(defaultW, defaultH)
 	w.SetResizable(true)
 	w.SetBackground(colBG)
@@ -350,7 +375,7 @@ func newMainWindow() *wui.Window {
 	w.Add(sbPaint)
 
 	title := wui.NewLabel()
-	title.SetText("FLP STUDIO TOOL")
+	title.SetText("FLP TOOL")
 	if fontTitle != nil {
 		title.SetFont(fontTitle)
 	}
@@ -623,6 +648,36 @@ func parseColorStrings(vals []string) flp.MutRGBA {
 	return flp.MutRGBA{R: get(0), G: get(1), B: get(2), A: get(3)}
 }
 
+// clampF restricts v to [lo, hi].
+func clampF(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// allEmpty reports whether every string is whitespace-only.
+func allEmpty(vals []string) bool {
+	for _, s := range vals {
+		if strings.TrimSpace(s) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// validIntString returns the decimal representation of v if v is within
+// [lo, hi], or "" if it's outside the range the corresponding setter accepts.
+func validIntString(v, lo, hi int) string {
+	if v < lo || v > hi {
+		return ""
+	}
+	return strconv.Itoa(v)
+}
+
 func arrTrackAt(p *flp.FLPProject, i int) (int, int, bool) {
 	n := 0
 	for ai, a := range p.Arrangements {
@@ -692,19 +747,32 @@ var editCategories = []categoryDef{
 				return make([]string, 8)
 			}
 			c := p.Channels[i]
+
 			name := ""
 			if c.Name != nil {
 				name = *c.Name
 			}
-			vol, pan := "1", "0"
+
+			// Volume/Pan: leave blank if the raw FL value is outside the
+			// range the setters accept, so we don't push garbage into them.
+			vol, pan := "", ""
 			if c.Levels != nil {
-				vol = fmtFloatShort(float64(c.Levels.Volume) / 12800.0)
-				pan = fmtFloatShort(float64(c.Levels.Pan) / 6400.0)
+				rawVol := float64(c.Levels.Volume)
+				rawPan := float64(c.Levels.Pan)
+				if rawVol >= 0 && rawVol <= 12800 {
+					vol = fmtFloatShort(rawVol / 12800.0)
+				}
+				if rawPan >= -6400 && rawPan <= 6400 {
+					pan = fmtFloatShort(rawPan / 6400.0)
+				}
 			}
-			ti := "-1"
+
+			// Routing: only emit if it's in the setter's accepted range.
+			ti := ""
 			if c.TargetInsert != nil {
-				ti = strconv.Itoa(*c.TargetInsert)
+				ti = validIntString(*c.TargetInsert, -1, 127)
 			}
+
 			col := colorStrings(c.Color)
 			return []string{name, vol, pan, ti, col[0], col[1], col[2], col[3]}
 		},
@@ -719,21 +787,32 @@ var editCategories = []categoryDef{
 			iid := p.Channels[i].Iid
 			cur := p
 			var err error
+
 			if strings.TrimSpace(v[0]) != "" {
 				if cur, err = flp.SetChannelName(cur, iid, v[0]); err != nil {
 					return nil, err
 				}
 			}
-			if cur, err = flp.SetChannelVolume(cur, iid, parseFloat(v[1])); err != nil {
-				return nil, err
+			if strings.TrimSpace(v[1]) != "" {
+				if cur, err = flp.SetChannelVolume(cur, iid, parseFloat(v[1])); err != nil {
+					return nil, err
+				}
 			}
-			if cur, err = flp.SetChannelPan(cur, iid, parseFloat(v[2])); err != nil {
-				return nil, err
+			if strings.TrimSpace(v[2]) != "" {
+				if cur, err = flp.SetChannelPan(cur, iid, parseFloat(v[2])); err != nil {
+					return nil, err
+				}
 			}
-			if cur, err = flp.SetChannelRouting(cur, iid, parseInt(v[3])); err != nil {
-				return nil, err
+			if strings.TrimSpace(v[3]) != "" {
+				if cur, err = flp.SetChannelRouting(cur, iid, parseInt(v[3])); err != nil {
+					return nil, err
+				}
 			}
-			cur, err = flp.SetChannelColor(cur, iid, parseColorStrings(v[4:]))
+			if !allEmpty(v[4:]) {
+				if cur, err = flp.SetChannelColor(cur, iid, parseColorStrings(v[4:])); err != nil {
+					return nil, err
+				}
+			}
 			return cur, err
 		},
 		msg: func(i int, _ []string) string {
@@ -787,7 +866,11 @@ var editCategories = []categoryDef{
 					return nil, err
 				}
 			}
-			cur, err = flp.SetPatternColor(cur, pid, parseColorStrings(v[2:]))
+			if !allEmpty(v[2:]) {
+				if cur, err = flp.SetPatternColor(cur, pid, parseColorStrings(v[2:])); err != nil {
+					return nil, err
+				}
+			}
 			return cur, err
 		},
 		msg: func(i int, _ []string) string {
@@ -827,10 +910,19 @@ var editCategories = []categoryDef{
 			idx := p.Inserts[i].Index
 			cur := p
 			var err error
-			if cur, err = flp.SetInsertName(cur, idx, v[0]); err != nil {
-				return nil, err
+
+			// Only write the name if the user actually typed something, so an
+			// empty field doesn't insert a spurious empty-name event.
+			if strings.TrimSpace(v[0]) != "" {
+				if cur, err = flp.SetInsertName(cur, idx, v[0]); err != nil {
+					return nil, err
+				}
 			}
-			cur, err = flp.SetInsertColor(cur, idx, parseColorStrings(v[1:]))
+			if !allEmpty(v[1:]) {
+				if cur, err = flp.SetInsertColor(cur, idx, parseColorStrings(v[1:])); err != nil {
+					return nil, err
+				}
+			}
 			return cur, err
 		},
 		msg: func(i int, _ []string) string {
@@ -902,9 +994,13 @@ var editCategories = []categoryDef{
 			if t.Name != nil {
 				name = *t.Name
 			}
-			grouped := "0"
-			if t.Grouped != nil && *t.Grouped {
-				grouped = "1"
+			grouped := ""
+			if t.Grouped != nil {
+				if *t.Grouped {
+					grouped = "1"
+				} else {
+					grouped = "0"
+				}
 			}
 			col := colorStrings(t.Color)
 			return []string{name, grouped, col[0], col[1], col[2], col[3]}
@@ -929,7 +1025,11 @@ var editCategories = []categoryDef{
 					return nil, err
 				}
 			}
-			cur, err = flp.SetTrackColor(cur, arrID, ti, parseColorStrings(v[2:]))
+			if !allEmpty(v[2:]) {
+				if cur, err = flp.SetTrackColor(cur, arrID, ti, parseColorStrings(v[2:])); err != nil {
+					return nil, err
+				}
+			}
 			return cur, err
 		},
 		msg: func(i int, _ []string) string {
@@ -1140,6 +1240,8 @@ func openEditTool(_ *wui.Window) {
 		next, err := cat.apply(app.Project, itemIndex, vals)
 		if err != nil {
 			status.SetText("Apply failed: " + err.Error())
+			fmt.Fprintf(os.Stderr, "[edit] apply failed (%s, item=%d, vals=%q): %v\n",
+				cat.label, itemIndex, vals, err)
 			return
 		}
 		app.Project = next
