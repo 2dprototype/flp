@@ -20,7 +20,7 @@ import (
 )
 
 // version is reported by `flp --version`.
-const version = "v0.0.1"
+const version = "v0.0.2"
 
 // Exit codes returned by the diff command.
 const (

@@ -1561,7 +1561,7 @@ func (p *MIDIPlayer) ReachedEnd() bool {
 const (
 	defaultW = 700
 	defaultH = 540
-	version  = "v0.0.1"
+	version  = "v0.0.2"
 
 	vizHeaderH    = 44
 	scrollbarSize = 12
@@ -1644,15 +1644,25 @@ var globalSynth = NewSynthConfig()
 
 // ───────────── persistent app config ─────────────
 
+// PresetEntry is one named SynthOptions preset in the preset store.
+type PresetEntry struct {
+	Name    string       `json:"name"`
+	Options SynthOptions `json:"options"`
+}
+
 // AppConfig is stored as <exe-basename>.json next to the executable.
 // Version tracks schema changes so future migrations can be applied.
 type AppConfig struct {
-	Version          int           `json:"version"`
-	FLStudioUserData string        `json:"fl_studio_user_data"`
-	Synth            *SynthOptions `json:"synth,omitempty"`
+	Version          int               `json:"version"`
+	FLStudioUserData string            `json:"fl_studio_user_data"`
+	Synth            *SynthOptions     `json:"synth,omitempty"`
+	Presets          []PresetEntry     `json:"presets,omitempty"`
+	// PatternPresets maps a pattern ID (decimal string) to a preset name.
+	// Absence of a key means "use the current live synth options".
+	PatternPresets map[string]string `json:"pattern_presets,omitempty"`
 }
 
-const appConfigVersion = 3
+const appConfigVersion = 4
 
 var appConfig AppConfig
 
@@ -1668,11 +1678,6 @@ func configFilePath() string {
 
 // loadAppConfig reads the config file, or creates one with sensible defaults,
 // then applies the persisted SynthOptions to globalSynth.
-//
-// We pre-populate appConfig with defaults before unmarshalling. Because Go's
-// encoding/json only overwrites fields that are present in the JSON payload,
-// this automatically migrates configs written by older versions that are
-// missing newly-added fields (like SampleSustain).
 func loadAppConfig() {
 	// Defaults first.
 	if home, herr := os.UserHomeDir(); herr == nil {
@@ -1697,6 +1702,10 @@ func loadAppConfig() {
 		}
 		appConfig.Version = appConfigVersion
 	}
+	// Ensure maps/slices we mutate later are non-nil.
+	if appConfig.PatternPresets == nil {
+		appConfig.PatternPresets = map[string]string{}
+	}
 
 	// Apply persisted synth parameters to the live config.
 	restored := *appConfig.Synth
@@ -1720,6 +1729,115 @@ func persistSynth() {
 	snapshot := globalSynth.Snapshot()
 	appConfig.Synth = &snapshot
 	saveAppConfig()
+}
+
+// ───────────── preset store helpers ─────────────
+
+// presetNames returns the ordered list of preset names (may be empty).
+func presetNames() []string {
+	out := make([]string, len(appConfig.Presets))
+	for i, p := range appConfig.Presets {
+		out[i] = p.Name
+	}
+	return out
+}
+
+// findPresetIndex returns the index of the named preset, or -1.
+func findPresetIndex(name string) int {
+	for i, p := range appConfig.Presets {
+		if p.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// upsertPreset adds a new preset or overwrites the existing one with that name.
+func upsertPreset(name string, opts SynthOptions) {
+	i := findPresetIndex(name)
+	if i >= 0 {
+		appConfig.Presets[i].Options = opts
+	} else {
+		appConfig.Presets = append(appConfig.Presets, PresetEntry{Name: name, Options: opts})
+	}
+	saveAppConfig()
+}
+
+// deletePreset removes a preset and clears any pattern assignments to it.
+func deletePreset(name string) {
+	i := findPresetIndex(name)
+	if i < 0 {
+		return
+	}
+	appConfig.Presets = append(appConfig.Presets[:i], appConfig.Presets[i+1:]...)
+	for k, v := range appConfig.PatternPresets {
+		if v == name {
+			delete(appConfig.PatternPresets, k)
+		}
+	}
+	saveAppConfig()
+}
+
+// renamePreset renames an existing preset and updates pattern assignments.
+// Returns false on invalid input or name collision.
+func renamePreset(oldName, newName string) bool {
+	if newName == "" || oldName == newName {
+		return false
+	}
+	i := findPresetIndex(oldName)
+	if i < 0 {
+		return false
+	}
+	if findPresetIndex(newName) >= 0 {
+		return false
+	}
+	appConfig.Presets[i].Name = newName
+	for k, v := range appConfig.PatternPresets {
+		if v == oldName {
+			appConfig.PatternPresets[k] = newName
+		}
+	}
+	saveAppConfig()
+	return true
+}
+
+// getPatternPresetOptions returns the preset assigned to the given pattern ID,
+// and true if one exists and resolves to a valid preset.
+func getPatternPresetOptions(patternID int) (SynthOptions, bool) {
+	if appConfig.PatternPresets == nil {
+		return SynthOptions{}, false
+	}
+	name, ok := appConfig.PatternPresets[strconv.Itoa(patternID)]
+	if !ok || name == "" {
+		return SynthOptions{}, false
+	}
+	i := findPresetIndex(name)
+	if i < 0 {
+		return SynthOptions{}, false
+	}
+	return appConfig.Presets[i].Options, true
+}
+
+// setPatternPreset assigns (or clears, when name == "") the preset for a pattern.
+func setPatternPreset(patternID int, name string) {
+	if appConfig.PatternPresets == nil {
+		appConfig.PatternPresets = map[string]string{}
+	}
+	key := strconv.Itoa(patternID)
+	if name == "" {
+		delete(appConfig.PatternPresets, key)
+	} else {
+		appConfig.PatternPresets[key] = name
+	}
+	saveAppConfig()
+}
+
+// getPatternPresetName returns the preset name assigned to a pattern, or "".
+func getPatternPresetName(patternID int) string {
+	if appConfig.PatternPresets == nil {
+		return ""
+	}
+	return appConfig.PatternPresets[strconv.Itoa(patternID)]
 }
 
 // ───────────────────────── text & ui helpers ─────────────────────────
@@ -3109,24 +3227,6 @@ func (s *vizState) currentTick() uint32 {
 	return s.manualTick
 }
 
-// arrangementCache holds a fully-rendered arrangement buffer. When the
-// project pointer, arrangement index and synth options are all unchanged
-// since the last render, the cached buffer is reused so re-clicking Play is
-// instantaneous even on large arrangements.
-type arrangementCache struct {
-	projectPtr *flp.FLPProject
-	arrIdx     int
-	opts       SynthOptions
-	buf        []float64
-	valid      bool
-}
-
-func (c *arrangementCache) matches(project *flp.FLPProject, arrIdx int, opts SynthOptions) bool {
-	return c.valid &&
-		c.projectPtr == project &&
-		c.arrIdx == arrIdx &&
-		c.opts == opts
-}
 
 func openVisualizerTool(_ *wui.Window) {
 	if app.Project == nil {
@@ -3137,6 +3237,25 @@ func openVisualizerTool(_ *wui.Window) {
 	w := newModal("Visualizer")
 	w.SetBackground(colCanvasBG)
 
+	// ── Async rendering state ──
+	type renderState struct {
+		active bool
+		start  time.Time
+		gen    int // bumped on every new request / cancellation
+	}
+	rs := &renderState{}
+
+	type renderResult struct {
+		buf       []float64
+		ppq       int
+		bpm       float64
+		startTick uint32
+		opts      SynthOptions
+		gen       int
+	}
+	renderDoneCh := make(chan renderResult, 1)
+
+	// ── Widgets ──
 	lblView := newLabel("View:", 0, 0, 40, labelH)
 	w.Add(lblView)
 	cmb := newCombo([]string{"arrangement", "pianoroll", "channels", "patterns", "mixer"}, 0, 0, 110, editH)
@@ -3146,6 +3265,11 @@ func openVisualizerTool(_ *wui.Window) {
 	w.Add(lblPat)
 	patCmb := newCombo([]string{}, 0, 0, 160, editH)
 	w.Add(patCmb)
+
+	lblPreset := newLabel("Preset:", 0, 0, 44, labelH)
+	w.Add(lblPreset)
+	presetCmb := newCombo([]string{"(default)"}, 0, 0, 220, editH)
+	w.Add(presetCmb)
 
 	lblZoom := newLabel("Zoom:", 0, 0, 44, labelH)
 	w.Add(lblZoom)
@@ -3161,6 +3285,39 @@ func openVisualizerTool(_ *wui.Window) {
 
 	btnPlay := newBtn("Play", 0, 0, 70, editH, nil)
 	w.Add(btnPlay)
+
+	// ── Tiny progress bar directly under the Play button ──
+	progressPb := wui.NewPaintBox()
+	progressPb.SetVisible(false)
+	w.Add(progressPb)
+	progressPb.SetOnPaint(func(c *wui.Canvas) {
+		cw, ch := c.Size()
+		if cw < 4 || ch < 2 {
+			return
+		}
+		c.FillRect(0, 0, cw, ch, wui.RGB(222, 226, 232))
+		if !rs.active {
+			return
+		}
+		// Marquee animation (indeterminate).
+		period := 1.0
+		phase := math.Mod(time.Since(rs.start).Seconds(), period) / period
+		chunkW := cw / 2
+		if chunkW < 16 {
+			chunkW = 16
+		}
+		x := int(phase*float64(cw+chunkW)) - chunkW
+		xs, xe := x, x+chunkW
+		if xs < 0 {
+			xs = 0
+		}
+		if xe > cw {
+			xe = cw
+		}
+		if xe > xs {
+			c.FillRect(xs, 0, xe-xs, ch, wui.RGB(70, 130, 220))
+		}
+	})
 
 	pb := wui.NewPaintBox()
 	w.Add(pb)
@@ -3180,7 +3337,12 @@ func openVisualizerTool(_ *wui.Window) {
 		synth:          globalSynth,
 	}
 
-	// ── Repopulate the selection combo based on the current view ──
+	// ── Helpers ──
+	updatePlayBtn := func() {
+		canPlay := (s.view == "arrangement" || s.view == "pianoroll") && !rs.active
+		btnPlay.SetEnabled(canPlay)
+	}
+
 	refreshSelection := func() {
 		if s.view == "arrangement" {
 			lblPat.SetText("Arr.:")
@@ -3225,40 +3387,80 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	}
 
+	refreshPresetCombo := func() {
+		if s.view != "pianoroll" || s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+			lblPreset.SetVisible(false)
+			presetCmb.SetVisible(false)
+			return
+		}
+		lblPreset.SetVisible(true)
+		presetCmb.SetVisible(true)
+
+		pid := s.project.Patterns[s.patternIdx].ID
+		cur := getPatternPresetName(pid)
+
+		items := []string{"(default)"}
+		items = append(items, presetNames()...)
+		presetCmb.SetItems(items)
+		idx := 0
+		if cur != "" {
+			if i := indexOf(items, cur); i >= 0 {
+				idx = i
+			}
+		}
+		presetCmb.SetSelectedIndex(idx)
+	}
+
+	// ── Layout: 2 compact rows, then the paint box ──
 	applyLayout(w, func(iw, ih int) {
 		contentW := iw - 2*margin
+		rightEdge := iw - margin
 		y := margin
+
+		// ── Row 1: View | Pattern | Preset (fills the remaining width) ──
 		x := margin
 		lblView.SetBounds(x, y+3, 40, labelH)
 		x += 40
 		cmb.SetBounds(x, y, 110, editH)
-		x += 120
+		x += 110 + 8
 
 		lblPat.SetBounds(x, y+3, 56, labelH)
 		x += 56
+		patCmb.SetBounds(x, y, 160, editH)
+		x += 160 + 8
 
-		right := margin + contentW
-		btnExportMIDI.SetBounds(right-100, y, 100, editH)
-		right -= 100 + 8
-		btnPlay.SetBounds(right-70, y, 70, editH)
-		right -= 70 + 8
-		btnFit.SetBounds(right-40, y, 40, editH)
-		right -= 40 + 6
-		btnZoomIn.SetBounds(right-28, y, 28, editH)
-		right -= 28 + 4
-		btnZoomOut.SetBounds(right-28, y, 28, editH)
-		right -= 28 + 8
-		lblZoom.SetBounds(right-44, y+3, 44, labelH)
-		right -= 44 + 10
-
-		patW := right - x
-		if patW < 100 {
-			patW = 100
+		lblPreset.SetBounds(x, y+3, 44, labelH)
+		x += 44
+		presetW := rightEdge - x
+		if presetW < 100 {
+			presetW = 100
 		}
-		patCmb.SetBounds(x, y, patW, editH)
+		presetCmb.SetBounds(x, y, presetW, editH)
 
-		y += editH + rowGap + 6
+		y += editH + 6
 
+		// ── Row 2: Zoom (left) — Play + Export (right) ──
+		x = margin
+		lblZoom.SetBounds(x, y+3, 44, labelH)
+		x += 44
+		btnZoomOut.SetBounds(x, y, 28, editH)
+		x += 28 + 4
+		btnZoomIn.SetBounds(x, y, 28, editH)
+		x += 28 + 4
+		btnFit.SetBounds(x, y, 40, editH)
+
+		r := rightEdge
+		btnExportMIDI.SetBounds(r-100, y, 100, editH)
+		r -= 100 + 8
+		playX := r - 70
+		btnPlay.SetBounds(playX, y, 70, editH)
+
+		// Tiny progress bar directly under the Play button.
+		progressPb.SetBounds(playX, y+editH+2, 70, 4)
+
+		y += editH + 10 // extra 6px so the progress bar has room
+
+		// ── Paint box ──
 		bottomH := btnH + margin
 		pbH := ih - y - bottomH
 		if pbH < 80 {
@@ -3274,8 +3476,49 @@ func openVisualizerTool(_ *wui.Window) {
 		renderViz(c, s)
 	})
 
-	// Playback repaint timer — only runs while playing.
+	// ── Playback / rendering timer ──
 	s.playTimer = w.AddTimer(16, func() {
+		// Render in progress — animate bar, poll for completion.
+		if rs.active {
+			select {
+			case rr := <-renderDoneCh:
+				if rr.gen != rs.gen {
+					// Stale render (view changed, new play queued) — discard.
+					rs.active = false
+					progressPb.SetVisible(false)
+					updatePlayBtn()
+					btnPlay.SetText("Play")
+					return
+				}
+				rs.active = false
+				progressPb.SetVisible(false)
+				updatePlayBtn()
+				btnPlay.SetText("Stop")
+
+				// Cache the arrangement buffer for instant replays.
+				if s.view == "arrangement" {
+					s.arrCache = arrangementCache{
+						projectPtr: s.project,
+						arrIdx:     s.arrangementIdx,
+						opts:       rr.opts,
+						buf:        rr.buf,
+						valid:      true,
+					}
+				}
+
+				if len(rr.buf) > 0 {
+					s.player.PlayBuffer(rr.buf, rr.ppq, rr.bpm, rr.startTick)
+				} else {
+					btnPlay.SetText("Play")
+					s.playTimer.Stop()
+				}
+			default:
+				progressPb.Paint()
+			}
+			return
+		}
+
+		// Normal playback update.
 		if s.player == nil || !s.player.IsPlaying() {
 			btnPlay.SetText("Play")
 			s.playTimer.Stop()
@@ -3299,17 +3542,22 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	}
 
+	// ── View change ──
 	cmb.SetOnChange(func(_ int) {
 		stopPlayback()
 		s.view = cmb.Items()[cmb.SelectedIndex()]
+		rs.gen++ // invalidate any pending render
 		s.scrollX, s.scrollY = 0, 0
 		refreshSelection()
 		if s.view == "pianoroll" {
 			centerPianoRoll(s)
 		}
+		refreshPresetCombo()
+		updatePlayBtn()
 		pb.Paint()
 	})
 
+	// ── Pattern / arrangement selection change ──
 	patCmb.SetOnChange(func(i int) {
 		if i < 0 {
 			return
@@ -3326,7 +3574,29 @@ func openVisualizerTool(_ *wui.Window) {
 				s.scrollX = 0
 			}
 		}
+		refreshPresetCombo()
 		pb.Paint()
+	})
+
+	// ── Preset combo ──
+	presetCmb.SetOnChange(func(i int) {
+		if s.view != "pianoroll" {
+			return
+		}
+		if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+			return
+		}
+		items := presetCmb.Items()
+		if i < 0 || i >= len(items) {
+			return
+		}
+		name := items[i]
+		pid := s.project.Patterns[s.patternIdx].ID
+		if name == "(default)" {
+			setPatternPreset(pid, "")
+		} else {
+			setPatternPreset(pid, name)
+		}
 	})
 
 	btnZoomIn.SetOnClick(func() {
@@ -3349,10 +3619,17 @@ func openVisualizerTool(_ *wui.Window) {
 		pb.Paint()
 	})
 
+	// ── Play button ──
 	btnPlay.SetOnClick(func() {
+		if rs.active {
+			return // already rendering
+		}
 		if s.player.IsPlaying() {
 			stopPlayback()
 			return
+		}
+		if s.view != "arrangement" && s.view != "pianoroll" {
+			return // play disabled in other views
 		}
 
 		bpm := 120.0
@@ -3364,46 +3641,86 @@ func openVisualizerTool(_ *wui.Window) {
 			ppq = 96
 		}
 
+		startTick := s.manualTick
+		opts := s.synth.Snapshot()
+
+		// ── Arrangement ──
 		if s.view == "arrangement" {
-			// ── Arrangement playback with cache ──
 			if s.arrangementIdx < 0 || s.arrangementIdx >= len(s.project.Arrangements) {
 				return
 			}
-			opts := s.synth.Snapshot()
-
-			var buf []float64
+			// Cache hit → play immediately, no rendering needed.
 			if s.arrCache.matches(s.project, s.arrangementIdx, opts) {
-				// Fast path — buffer already rendered.
-				buf = s.arrCache.buf
-			} else {
-				arr := s.project.Arrangements[s.arrangementIdx]
-				buf = renderArrangement(arr, s.project.Patterns, ppq, bpm,
-					opts, s.project.Channels, s.source)
-				s.arrCache = arrangementCache{
-					projectPtr: s.project,
-					arrIdx:     s.arrangementIdx,
-					opts:       opts,
-					buf:        buf,
-					valid:      true,
+				buf := s.arrCache.buf
+				if len(buf) == 0 {
+					return
 				}
+				s.player.PlayBuffer(buf, ppq, bpm, startTick)
+				btnPlay.SetText("Stop")
+				s.playTimer.Start()
+				return
 			}
 
-			if len(buf) == 0 {
-				return
-			}
-			s.player.PlayBuffer(buf, ppq, bpm, s.manualTick)
-		} else {
-			// ── Pattern playback (existing path) ──
-			if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
-				return
-			}
-			pat := s.project.Patterns[s.patternIdx]
-			s.player.PlayPattern(pat, ppq, bpm, s.synth.Snapshot(),
-				s.manualTick, s.project.Channels, s.source)
+			arr := s.project.Arrangements[s.arrangementIdx]
+			patterns := s.project.Patterns
+			channels := s.project.Channels
+			src := s.source
+
+			rs.active = true
+			rs.start = time.Now()
+			rs.gen++
+			myGen := rs.gen
+
+			progressPb.SetVisible(true)
+			btnPlay.SetText("...")
+			updatePlayBtn()
+			progressPb.Paint()
+			s.playTimer.Start()
+
+			go func() {
+				buf := renderArrangement(arr, patterns, ppq, bpm, opts, channels, src)
+				select {
+				case renderDoneCh <- renderResult{
+					buf: buf, ppq: ppq, bpm: bpm, startTick: startTick, opts: opts, gen: myGen,
+				}:
+				default:
+					// A newer render has superseded this one.
+				}
+			}()
+			return
 		}
 
-		btnPlay.SetText("Stop")
+		// ── Piano roll ──
+		if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+			return
+		}
+		pat := s.project.Patterns[s.patternIdx]
+		if po, ok := getPatternPresetOptions(pat.ID); ok {
+			opts = po
+		}
+		channels := s.project.Channels
+		src := s.source
+
+		rs.active = true
+		rs.start = time.Now()
+		rs.gen++
+		myGen := rs.gen
+
+		progressPb.SetVisible(true)
+		btnPlay.SetText("...")
+		updatePlayBtn()
+		progressPb.Paint()
 		s.playTimer.Start()
+
+		go func() {
+			buf := renderPattern(pat, ppq, bpm, opts, channels, src)
+			select {
+			case renderDoneCh <- renderResult{
+				buf: buf, ppq: ppq, bpm: bpm, startTick: startTick, opts: opts, gen: myGen,
+			}:
+			default:
+			}
+		}()
 	})
 
 	w.SetOnMouseWheel(func(x, y int, delta float64) {
@@ -3470,11 +3787,11 @@ func openVisualizerTool(_ *wui.Window) {
 			pb.Paint()
 		}
 	})
-	
+
 	w.SetOnMouseUp(func(_ wui.MouseButton, x, y int) {
 		s.dragMode = 0
 	})
-	
+
 	pb.SetOnMouseMove(func(x, y int) {
 		if s.dragMode == 0 {
 			return
@@ -3503,11 +3820,32 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	})
 
-	// Populate the combo based on the initial view ("arrangement").
+	// Populate combos and button state for the initial view.
 	refreshSelection()
+	refreshPresetCombo()
+	updatePlayBtn()
 
 	defer stopPlayback()
 	showModal(w)
+}
+
+// arrangementCache holds a fully-rendered arrangement buffer. When the
+// project pointer, arrangement index and synth options are all unchanged
+// since the last render, the cached buffer is reused so re-clicking Play is
+// instantaneous even on large arrangements.
+type arrangementCache struct {
+	projectPtr *flp.FLPProject
+	arrIdx     int
+	opts       SynthOptions
+	buf        []float64
+	valid      bool
+}
+
+func (c *arrangementCache) matches(project *flp.FLPProject, arrIdx int, opts SynthOptions) bool {
+	return c.valid &&
+		c.projectPtr == project &&
+		c.arrIdx == arrIdx &&
+		c.opts == opts
 }
 
 // handleTimelineScrub converts a mouse coordinate inside the timeline view
@@ -5324,9 +5662,6 @@ func addSynthCombo(parent ctrlAdder, x, y, labelW, editW int, label string,
 
 func openSynthSettingsTool(_ *wui.Window) {
 	w := newModal("Synthesizer")
-
-	// Persist the live synth to the config whenever the modal closes, no
-	// matter how it was closed (Close button, X, Alt+F4, Esc, ...).
 	w.SetOnClose(persistSynth)
 
 	initial := globalSynth.Snapshot()
@@ -5502,26 +5837,29 @@ func openSynthSettingsTool(_ *wui.Window) {
 		panels = append(panels, p)
 	}
 
-	// ── Oscillator panel ──
+	// Compact row pitch used inside every panel.
+	const rowH = 32
+
+	// ── Oscillator panel: 2 cols × 4 rows ──
 	{
 		p := panels[0]
 		waveItems := []string{"sine", "square", "saw", "triangle", "noise"}
 		wave2Items := []string{"off", "sine", "square", "saw", "triangle", "noise"}
 
-		ws.wave1 = addSynthCombo(p, 20, 20, 90, 150, "Waveform 1", waveItems,
+		ws.wave1 = addSynthCombo(p, 15, 8, 90, 130, "Wave 1", waveItems,
 			indexOf(waveItems, initial.Waveform1), func(int) { sync() })
-		ws.wave2 = addSynthCombo(p, 20, 60, 90, 150, "Waveform 2", wave2Items,
+		ws.wave2 = addSynthCombo(p, 15, 8+rowH, 90, 130, "Wave 2", wave2Items,
 			indexOf(wave2Items, initial.Waveform2), func(int) { sync() })
-		ws.osc2Detune = addSynthFloat(p, 20, 100, 100, 120, "Osc2 detune (st)",
+		ws.osc2Detune = addSynthFloat(p, 15, 8+2*rowH, 90, 130, "Detune (st)",
 			-24, 24, 2, initial.Osc2Detune, func(float64) { sync() })
-		ws.osc2Mix = addSynthFloat(p, 20, 140, 100, 120, "Osc2 mix",
+		ws.osc2Mix = addSynthFloat(p, 15, 8+3*rowH, 90, 130, "Osc2 mix",
 			0, 1, 3, initial.Osc2Mix, func(float64) { sync() })
 
-		ws.subLevel = addSynthFloat(p, 360, 20, 110, 120, "Sub level",
+		ws.subLevel = addSynthFloat(p, 340, 8, 90, 130, "Sub level",
 			0, 1, 3, initial.SubLevel, func(float64) { sync() })
-		ws.unisonVoices = addSynthInt(p, 360, 60, 110, 120, "Unison voices",
+		ws.unisonVoices = addSynthInt(p, 340, 8+rowH, 90, 130, "Unison v.",
 			1, 7, initial.UnisonVoices, func(int) { sync() })
-		ws.unisonDetune = addSynthFloat(p, 360, 100, 110, 120, "Unison detune (c)",
+		ws.unisonDetune = addSynthFloat(p, 340, 8+2*rowH, 90, 130, "U. detune (c)",
 			0, 50, 1, initial.UnisonDetune, func(float64) { sync() })
 	}
 
@@ -5530,33 +5868,34 @@ func openSynthSettingsTool(_ *wui.Window) {
 		p := panels[1]
 		ftypes := []string{"off", "lp", "hp", "bp", "notch"}
 
-		ws.filtType = addSynthCombo(p, 20, 20, 90, 130, "Filter type", ftypes,
+		ws.filtType = addSynthCombo(p, 15, 8, 90, 130, "Type", ftypes,
 			indexOf(ftypes, initial.FilterType), func(int) { sync() })
-		ws.filtCutoff = addSynthFloat(p, 20, 60, 100, 120, "Cutoff (Hz)",
+		ws.filtCutoff = addSynthFloat(p, 15, 8+rowH, 90, 130, "Cutoff (Hz)",
 			20, 18000, 1, initial.FilterCutoff, func(float64) { sync() })
-		ws.filtReso = addSynthFloat(p, 20, 100, 100, 120, "Resonance (Q)",
+		ws.filtReso = addSynthFloat(p, 15, 8+2*rowH, 90, 130, "Resonance (Q)",
 			0.5, 20, 2, initial.FilterReso, func(float64) { sync() })
-		ws.filtEnvAmt = addSynthFloat(p, 20, 140, 100, 120, "Env amount (oct)",
+
+		ws.filtEnvAmt = addSynthFloat(p, 340, 8, 90, 130, "Env amt (oct)",
 			-4, 4, 2, initial.FilterEnvAmt, func(float64) { sync() })
-		ws.filtKeyTrack = addSynthFloat(p, 360, 20, 130, 120, "Key tracking",
+		ws.filtKeyTrack = addSynthFloat(p, 340, 8+rowH, 90, 130, "Key track",
 			0, 1, 3, initial.FilterKeyTrack, func(float64) { sync() })
 	}
 
-	// ── Envelopes panel ──
+	// ── Envelopes panel: two 4-knob rows ──
 	{
 		p := panels[2]
 
-		addSynthHeader(p, 20, 10, 300, "Amplitude envelope")
-		ws.aA = addSynthFloat(p, 20, 38, 60, 90, "A (s)", 0.001, 4, 3, initial.Attack, func(float64) { sync() })
-		ws.aD = addSynthFloat(p, 190, 38, 60, 90, "D (s)", 0.001, 4, 3, initial.Decay, func(float64) { sync() })
-		ws.aS = addSynthFloat(p, 20, 74, 60, 90, "S", 0, 1, 3, initial.Sustain, func(float64) { sync() })
-		ws.aR = addSynthFloat(p, 190, 74, 60, 90, "R (s)", 0.001, 4, 3, initial.Release, func(float64) { sync() })
+		addSynthHeader(p, 15, 4, 300, "Amplitude envelope")
+		ws.aA = addSynthFloat(p, 15, 26, 30, 60, "A", 0.001, 4, 3, initial.Attack, func(float64) { sync() })
+		ws.aD = addSynthFloat(p, 130, 26, 30, 60, "D", 0.001, 4, 3, initial.Decay, func(float64) { sync() })
+		ws.aS = addSynthFloat(p, 245, 26, 30, 60, "S", 0, 1, 3, initial.Sustain, func(float64) { sync() })
+		ws.aR = addSynthFloat(p, 360, 26, 30, 60, "R", 0.001, 4, 3, initial.Release, func(float64) { sync() })
 
-		addSynthHeader(p, 20, 120, 300, "Filter envelope")
-		ws.fA = addSynthFloat(p, 20, 148, 60, 90, "A (s)", 0.001, 4, 3, initial.FAttack, func(float64) { sync() })
-		ws.fD = addSynthFloat(p, 190, 148, 60, 90, "D (s)", 0.001, 4, 3, initial.FDecay, func(float64) { sync() })
-		ws.fS = addSynthFloat(p, 20, 184, 60, 90, "S", 0, 1, 3, initial.FSustain, func(float64) { sync() })
-		ws.fR = addSynthFloat(p, 190, 184, 60, 90, "R (s)", 0.001, 4, 3, initial.FRelease, func(float64) { sync() })
+		addSynthHeader(p, 15, 70, 300, "Filter envelope")
+		ws.fA = addSynthFloat(p, 15, 92, 30, 60, "A", 0.001, 4, 3, initial.FAttack, func(float64) { sync() })
+		ws.fD = addSynthFloat(p, 130, 92, 30, 60, "D", 0.001, 4, 3, initial.FDecay, func(float64) { sync() })
+		ws.fS = addSynthFloat(p, 245, 92, 30, 60, "S", 0, 1, 3, initial.FSustain, func(float64) { sync() })
+		ws.fR = addSynthFloat(p, 360, 92, 30, 60, "R", 0.001, 4, 3, initial.FRelease, func(float64) { sync() })
 	}
 
 	// ── LFO panel ──
@@ -5565,70 +5904,59 @@ func openSynthSettingsTool(_ *wui.Window) {
 		lfoShapes := []string{"off", "sine", "tri", "square", "saw"}
 		targets := []string{"off", "amp", "filter"}
 
-		ws.lfoShape = addSynthCombo(p, 20, 20, 90, 130, "Shape", lfoShapes,
+		ws.lfoShape = addSynthCombo(p, 15, 8, 90, 130, "Shape", lfoShapes,
 			indexOf(lfoShapes, initial.LFOShape), func(int) { sync() })
-		ws.lfoRate = addSynthFloat(p, 20, 60, 100, 120, "Rate (Hz)",
+		ws.lfoRate = addSynthFloat(p, 15, 8+rowH, 90, 130, "Rate (Hz)",
 			0.05, 20, 2, initial.LFORate, func(float64) { sync() })
-		ws.lfoDepth = addSynthFloat(p, 20, 100, 100, 120, "Depth",
+		ws.lfoDepth = addSynthFloat(p, 15, 8+2*rowH, 90, 130, "Depth",
 			0, 1, 3, initial.LFODepth, func(float64) { sync() })
-		ws.lfoTarget = addSynthCombo(p, 360, 20, 100, 130, "Target", targets,
+
+		ws.lfoTarget = addSynthCombo(p, 340, 8, 90, 130, "Target", targets,
 			indexOf(targets, initial.LFOTarget), func(int) { sync() })
-		ws.lfoPitch = addSynthFloat(p, 360, 60, 130, 90, "Pitch (st, reserved)",
+		ws.lfoPitch = addSynthFloat(p, 340, 8+rowH, 90, 130, "Pitch (st)",
 			0, 12, 2, initial.LFOPitch, func(float64) { sync() })
 	}
 
-	// ── FX panel ──
+	// ── FX panel: drive / delay / reverb stacked ──
 	{
 		p := panels[4]
 
-		addSynthHeader(p, 20, 10, 200, "Drive")
-		ws.drive = addSynthFloat(p, 20, 40, 100, 110, "Drive",
-			0, 1, 3, initial.Drive, func(float64) { sync() })
+		addSynthHeader(p, 15, 4, 200, "Drive")
+		ws.drive = addSynthFloat(p, 15, 24, 60, 100, "", 0, 1, 3, initial.Drive, func(float64) { sync() })
 
-		addSynthHeader(p, 20, 80, 300, "Delay")
-		ws.delTime = addSynthFloat(p, 20, 110, 100, 90, "Time (s)",
-			0.01, 1.0, 3, initial.DelayTime, func(float64) { sync() })
-		ws.delFeed = addSynthFloat(p, 230, 110, 100, 90, "Feedback",
-			0, 0.9, 2, initial.DelayFeed, func(float64) { sync() })
-		ws.delMix = addSynthFloat(p, 440, 110, 100, 90, "Mix",
-			0, 1, 3, initial.DelayMix, func(float64) { sync() })
+		addSynthHeader(p, 15, 58, 300, "Delay")
+		ws.delTime = addSynthFloat(p, 15, 78, 55, 70, "Time", 0.01, 1.0, 3, initial.DelayTime, func(float64) { sync() })
+		ws.delFeed = addSynthFloat(p, 210, 78, 55, 70, "FB", 0, 0.9, 2, initial.DelayFeed, func(float64) { sync() })
+		ws.delMix = addSynthFloat(p, 405, 78, 55, 70, "Mix", 0, 1, 3, initial.DelayMix, func(float64) { sync() })
 
-		addSynthHeader(p, 20, 155, 300, "Reverb")
-		ws.revSize = addSynthFloat(p, 20, 185, 100, 90, "Size",
-			0, 1, 3, initial.ReverbSize, func(float64) { sync() })
-		ws.revMix = addSynthFloat(p, 230, 185, 100, 90, "Mix",
-			0, 1, 3, initial.ReverbMix, func(float64) { sync() })
+		addSynthHeader(p, 15, 112, 300, "Reverb")
+		ws.revSize = addSynthFloat(p, 15, 132, 55, 70, "Size", 0, 1, 3, initial.ReverbSize, func(float64) { sync() })
+		ws.revMix = addSynthFloat(p, 210, 132, 55, 70, "Mix", 0, 1, 3, initial.ReverbMix, func(float64) { sync() })
 	}
 
-	// ── Sample panel ──
+	// ── Sample panel: envelope | output | user data ──
 	{
 		p := panels[5]
 
-		// ── Envelope (left) ──
-		addSynthHeader(p, 20, 10, 220, "Sample envelope")
-		ws.sampleAttack = addSynthFloat(p, 20, 40, 80, 100, "Attack (s)",
-			0, 0.5, 4, initial.SampleAttack, func(float64) { sync() })
-		ws.sampleDecay = addSynthFloat(p, 20, 76, 80, 100, "Decay (s)",
-			0, 0.5, 4, initial.SampleDecay, func(float64) { sync() })
-		ws.sampleSustain = addSynthFloat(p, 20, 112, 80, 100, "Sustain",
-			0, 1, 3, initial.SampleSustain, func(float64) { sync() })
-		ws.sampleRelease = addSynthFloat(p, 20, 148, 80, 100, "Release (s)",
-			0, 0.5, 4, initial.SampleRelease, func(float64) { sync() })
+		// Left column — Sample envelope
+		addSynthHeader(p, 15, 4, 180, "Sample envelope")
+		ws.sampleAttack = addSynthFloat(p, 15, 26, 45, 65, "A", 0, 0.5, 4, initial.SampleAttack, func(float64) { sync() })
+		ws.sampleDecay = addSynthFloat(p, 15, 26+rowH, 45, 65, "D", 0, 0.5, 4, initial.SampleDecay, func(float64) { sync() })
+		ws.sampleSustain = addSynthFloat(p, 15, 26+2*rowH, 45, 65, "S", 0, 1, 3, initial.SampleSustain, func(float64) { sync() })
+		ws.sampleRelease = addSynthFloat(p, 15, 26+3*rowH, 45, 65, "R", 0, 0.5, 4, initial.SampleRelease, func(float64) { sync() })
 
-		// ── Output (middle) ──
-		addSynthHeader(p, 220, 10, 130, "Sample output")
-		ws.sampleVolume = addSynthFloat(p, 220, 40, 60, 80, "Volume",
-			0, 2, 3, initial.SampleVolume, func(float64) { sync() })
-		ws.samplePitch = addSynthFloat(p, 220, 76, 60, 80, "Pitch (st)",
-			-24, 24, 2, initial.SamplePitch, func(float64) { sync() })
+		// Middle column — Output
+		addSynthHeader(p, 165, 4, 130, "Output")
+		ws.sampleVolume = addSynthFloat(p, 165, 26, 45, 65, "Vol", 0, 2, 3, initial.SampleVolume, func(float64) { sync() })
+		ws.samplePitch = addSynthFloat(p, 165, 26+rowH, 45, 65, "Pitch", -24, 24, 2, initial.SamplePitch, func(float64) { sync() })
 
-		// ── FL Studio user data (right) ──
-		addSynthHeader(p, 360, 10, 280, "FL Studio user data")
-		userLbl := newLabel("Path:", 360, 44, 40, labelH)
+		// Right column — FL Studio user data
+		addSynthHeader(p, 315, 4, 330, "FL Studio user data")
+		userLbl := newLabel("Path:", 315, 30, 40, labelH)
 		p.Add(userLbl)
 
 		userEdit := wui.NewEditLine()
-		userEdit.SetBounds(400, 40, 220, editH)
+		userEdit.SetBounds(355, 28, 260, editH)
 		userEdit.SetText(appConfig.FLStudioUserData)
 		userEdit.SetOnTextChange(func() {
 			appConfig.FLStudioUserData = userEdit.Text()
@@ -5639,7 +5967,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 		}
 		p.Add(userEdit)
 
-		userBrowse := newBtn("Browse...", 360, 76, 100, editH, func() {
+		userBrowse := newBtn("Browse...", 315, 28+rowH, 100, editH, func() {
 			dlg := wui.NewFolderSelectDialog()
 			dlg.SetTitle("Select FL Studio user data folder")
 			if ok, path := dlg.Execute(w); ok && path != "" {
@@ -5652,12 +5980,188 @@ func openSynthSettingsTool(_ *wui.Window) {
 
 		userInfo := newLabel(
 			"Used to resolve %FLStudioUserData% paths and\n"+
-				"as a fallback root for relative samples.\n"+
-				"Saved next to the executable.",
-			360, 116, 260, 70)
+				"as a fallback root for relative samples.",
+			315, 28+2*rowH, 300, 40)
 		p.Add(userInfo)
 	}
-	
+
+	// ── applyOptsToWidgets pushes a SynthOptions into all widgets. ──
+	applyOptsToWidgets := func(o SynthOptions) {
+		ws.wave1.SetSelectedIndex(indexOf(ws.wave1.Items(), o.Waveform1))
+		ws.wave2.SetSelectedIndex(indexOf(ws.wave2.Items(), o.Waveform2))
+		ws.osc2Detune.SetValue(o.Osc2Detune)
+		ws.osc2Mix.SetValue(o.Osc2Mix)
+		ws.subLevel.SetValue(o.SubLevel)
+		ws.unisonVoices.SetValue(o.UnisonVoices)
+		ws.unisonDetune.SetValue(o.UnisonDetune)
+
+		ws.filtType.SetSelectedIndex(indexOf(ws.filtType.Items(), o.FilterType))
+		ws.filtCutoff.SetValue(o.FilterCutoff)
+		ws.filtReso.SetValue(o.FilterReso)
+		ws.filtEnvAmt.SetValue(o.FilterEnvAmt)
+		ws.filtKeyTrack.SetValue(o.FilterKeyTrack)
+
+		ws.aA.SetValue(o.Attack)
+		ws.aD.SetValue(o.Decay)
+		ws.aS.SetValue(o.Sustain)
+		ws.aR.SetValue(o.Release)
+		ws.fA.SetValue(o.FAttack)
+		ws.fD.SetValue(o.FDecay)
+		ws.fS.SetValue(o.FSustain)
+		ws.fR.SetValue(o.FRelease)
+
+		ws.lfoShape.SetSelectedIndex(indexOf(ws.lfoShape.Items(), o.LFOShape))
+		ws.lfoRate.SetValue(o.LFORate)
+		ws.lfoDepth.SetValue(o.LFODepth)
+		ws.lfoTarget.SetSelectedIndex(indexOf(ws.lfoTarget.Items(), o.LFOTarget))
+		ws.lfoPitch.SetValue(o.LFOPitch)
+
+		ws.drive.SetValue(o.Drive)
+		ws.delTime.SetValue(o.DelayTime)
+		ws.delFeed.SetValue(o.DelayFeed)
+		ws.delMix.SetValue(o.DelayMix)
+		ws.revSize.SetValue(o.ReverbSize)
+		ws.revMix.SetValue(o.ReverbMix)
+
+		ws.gain.SetValue(o.Gain)
+		ws.velAmp.SetValue(o.VelToAmp)
+		ws.velFilt.SetValue(o.VelToFilt)
+
+		ws.sampleAttack.SetValue(o.SampleAttack)
+		ws.sampleDecay.SetValue(o.SampleDecay)
+		ws.sampleSustain.SetValue(o.SampleSustain)
+		ws.sampleRelease.SetValue(o.SampleRelease)
+		ws.sampleVolume.SetValue(o.SampleVolume)
+		ws.samplePitch.SetValue(o.SamplePitch)
+
+		previewValid = false
+		prevPb.Paint()
+	}
+
+	// ── Preset store controls (top row) ──
+	presetLbl := newLabel("Preset:", 0, 0, 46, labelH)
+	w.Add(presetLbl)
+
+	presetCmb := wui.NewComboBox()
+	presetCmb.SetBounds(0, 0, 130, editH)
+	if fontNormal != nil {
+		presetCmb.SetFont(fontNormal)
+	}
+	w.Add(presetCmb)
+
+	nameLbl := newLabel("Name:", 0, 0, 40, labelH)
+	w.Add(nameLbl)
+
+	nameEdit := newEdit(0, 0, 110, editH)
+	w.Add(nameEdit)
+
+	btnSaveAs := newBtn("Save As", 0, 0, 72, editH, nil)
+	w.Add(btnSaveAs)
+	btnRename := newBtn("Rename", 0, 0, 72, editH, nil)
+	w.Add(btnRename)
+	btnDelete := newBtn("Delete", 0, 0, 68, editH, nil)
+	w.Add(btnDelete)
+	btnLoad := newBtn("Load", 0, 0, 60, editH, nil)
+	w.Add(btnLoad)
+
+	refreshPresetCombo := func(selectName string) {
+		names := presetNames()
+		if len(names) == 0 {
+			presetCmb.SetItems([]string{"(no presets)"})
+			presetCmb.SetSelectedIndex(0)
+			return
+		}
+		presetCmb.SetItems(names)
+		idx := 0
+		if selectName != "" {
+			if i := indexOf(names, selectName); i >= 0 {
+				idx = i
+			}
+		}
+		presetCmb.SetSelectedIndex(idx)
+	}
+
+	selectedPresetName := func() string {
+		names := presetNames()
+		if len(names) == 0 {
+			return ""
+		}
+		i := presetCmb.SelectedIndex()
+		if i < 0 || i >= len(names) {
+			return ""
+		}
+		return names[i]
+	}
+
+	refreshPresetCombo("")
+
+	presetCmb.SetOnChange(func(i int) {
+		names := presetNames()
+		if i < 0 || i >= len(names) {
+			nameEdit.SetText("")
+			return
+		}
+		nameEdit.SetText(names[i])
+	})
+
+	btnSaveAs.SetOnClick(func() {
+		name := strings.TrimSpace(nameEdit.Text())
+		if name == "" {
+			wui.MessageBoxError("Preset", "Please enter a name in the Name field first.")
+			return
+		}
+		opts := globalSynth.Snapshot()
+		upsertPreset(name, opts)
+		refreshPresetCombo(name)
+	})
+
+	btnLoad.SetOnClick(func() {
+		name := strings.TrimSpace(nameEdit.Text())
+		if name == "" {
+			name = selectedPresetName()
+		}
+		i := findPresetIndex(name)
+		if i < 0 {
+			wui.MessageBoxError("Preset", "No preset named '"+name+"'.")
+			return
+		}
+		opts := appConfig.Presets[i].Options
+		globalSynth.Update(func(o *SynthOptions) { *o = opts })
+		applyOptsToWidgets(opts)
+		refreshPresetCombo(name)
+	})
+
+	btnRename.SetOnClick(func() {
+		oldName := selectedPresetName()
+		newName := strings.TrimSpace(nameEdit.Text())
+		if oldName == "" {
+			wui.MessageBoxError("Preset", "Select a preset to rename.")
+			return
+		}
+		if newName == "" {
+			wui.MessageBoxError("Preset", "Enter the new name in the Name field.")
+			return
+		}
+		if oldName == newName {
+			return
+		}
+		if !renamePreset(oldName, newName) {
+			wui.MessageBoxError("Preset", "Cannot rename: a preset named '"+newName+"' already exists.")
+			return
+		}
+		refreshPresetCombo(newName)
+	})
+
+	btnDelete.SetOnClick(func() {
+		name := selectedPresetName()
+		if name == "" {
+			return
+		}
+		deletePreset(name)
+		refreshPresetCombo("")
+		nameEdit.SetText("")
+	})
+
 	// ── Master row ──
 	masterLbl := newLabel("Master", 0, 0, 60, labelH)
 	if fontBold != nil {
@@ -5665,7 +6169,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 	}
 	w.Add(masterLbl)
 
-	gainLbl := newLabel("Gain", 0, 0, 40, labelH)
+	gainLbl := newLabel("Gain", 0, 0, 36, labelH)
 	w.Add(gainLbl)
 	ws.gain = wui.NewFloatUpDown()
 	ws.gain.SetMinMax(0, 1)
@@ -5674,7 +6178,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 	ws.gain.SetOnValueChange(func(float64) { sync() })
 	w.Add(ws.gain)
 
-	velAmpLbl := newLabel("Vel→Amp", 0, 0, 70, labelH)
+	velAmpLbl := newLabel("Vel→Amp", 0, 0, 66, labelH)
 	w.Add(velAmpLbl)
 	ws.velAmp = wui.NewFloatUpDown()
 	ws.velAmp.SetMinMax(0, 1)
@@ -5683,7 +6187,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 	ws.velAmp.SetOnValueChange(func(float64) { sync() })
 	w.Add(ws.velAmp)
 
-	velFiltLbl := newLabel("Vel→Filter", 0, 0, 80, labelH)
+	velFiltLbl := newLabel("Vel→Filter", 0, 0, 76, labelH)
 	w.Add(velFiltLbl)
 	ws.velFilt = wui.NewFloatUpDown()
 	ws.velFilt.SetMinMax(0, 1)
@@ -5700,9 +6204,9 @@ func openSynthSettingsTool(_ *wui.Window) {
 	w.Add(prevLbl)
 
 	// ── Buttons ──
-	btnPreview := newBtn("Preview Note", 0, 0, 130, btnH, nil)
+	btnPreview := newBtn("Preview Note", 0, 0, 120, btnH, nil)
 	w.Add(btnPreview)
-	btnReset := newBtn("Reset", 0, 0, 90, btnH, nil)
+	btnReset := newBtn("Reset", 0, 0, 80, btnH, nil)
 	w.Add(btnReset)
 	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() {
 		persistSynth()
@@ -5720,60 +6224,9 @@ func openSynthSettingsTool(_ *wui.Window) {
 	btnReset.SetOnClick(func() {
 		def := defaultSynthOptions()
 		globalSynth.Update(func(o *SynthOptions) { *o = def })
-
-		ws.wave1.SetSelectedIndex(indexOf(ws.wave1.Items(), def.Waveform1))
-		ws.wave2.SetSelectedIndex(indexOf(ws.wave2.Items(), def.Waveform2))
-		ws.osc2Detune.SetValue(def.Osc2Detune)
-		ws.osc2Mix.SetValue(def.Osc2Mix)
-		ws.subLevel.SetValue(def.SubLevel)
-		ws.unisonVoices.SetValue(def.UnisonVoices)
-		ws.unisonDetune.SetValue(def.UnisonDetune)
-
-		ws.filtType.SetSelectedIndex(indexOf(ws.filtType.Items(), def.FilterType))
-		ws.filtCutoff.SetValue(def.FilterCutoff)
-		ws.filtReso.SetValue(def.FilterReso)
-		ws.filtEnvAmt.SetValue(def.FilterEnvAmt)
-		ws.filtKeyTrack.SetValue(def.FilterKeyTrack)
-
-		ws.aA.SetValue(def.Attack)
-		ws.aD.SetValue(def.Decay)
-		ws.aS.SetValue(def.Sustain)
-		ws.aR.SetValue(def.Release)
-		ws.fA.SetValue(def.FAttack)
-		ws.fD.SetValue(def.FDecay)
-		ws.fS.SetValue(def.FSustain)
-		ws.fR.SetValue(def.FRelease)
-
-		ws.lfoShape.SetSelectedIndex(indexOf(ws.lfoShape.Items(), def.LFOShape))
-		ws.lfoRate.SetValue(def.LFORate)
-		ws.lfoDepth.SetValue(def.LFODepth)
-		ws.lfoTarget.SetSelectedIndex(indexOf(ws.lfoTarget.Items(), def.LFOTarget))
-		ws.lfoPitch.SetValue(def.LFOPitch)
-
-		ws.drive.SetValue(def.Drive)
-		ws.delTime.SetValue(def.DelayTime)
-		ws.delFeed.SetValue(def.DelayFeed)
-		ws.delMix.SetValue(def.DelayMix)
-		ws.revSize.SetValue(def.ReverbSize)
-		ws.revMix.SetValue(def.ReverbMix)
-
-		ws.gain.SetValue(def.Gain)
-		ws.velAmp.SetValue(def.VelToAmp)
-		ws.velFilt.SetValue(def.VelToFilt)
-
-		// Sample
-		ws.sampleAttack.SetValue(def.SampleAttack)
-		ws.sampleDecay.SetValue(def.SampleDecay)
-		ws.sampleSustain.SetValue(def.SampleSustain)
-		ws.sampleRelease.SetValue(def.SampleRelease)
-		ws.sampleVolume.SetValue(def.SampleVolume)
-		ws.samplePitch.SetValue(def.SamplePitch)
-
-		previewValid = false
-		prevPb.Paint()
+		applyOptsToWidgets(def)
 	})
-	
-	// ── Tab switching ──
+
 	tabs.SetOnChange(func(idx int) {
 		for i, p := range panels {
 			p.SetVisible(i == idx)
@@ -5782,42 +6235,63 @@ func openSynthSettingsTool(_ *wui.Window) {
 
 	// ── Layout ──
 	applyLayout(w, func(iw, ih int) {
-		tabX := margin
-		tabY := margin
-		tabW := iw - 2*margin
-		tabH := 280
-		tabs.SetBounds(tabX, tabY, tabW, tabH)
+		const smallGap = 6
+		const topMargin = 12
+		const botMargin = 12
 
+		// ── Row 1: preset store ──
+		y := topMargin
+		presetLbl.SetBounds(margin, y+4, 46, labelH)
+		presetCmb.SetBounds(margin+46, y, 130, editH)
+		nameLbl.SetBounds(margin+46+130+10, y+4, 40, labelH)
+		nameEdit.SetBounds(margin+46+130+10+40, y, 110, editH)
+
+		btnX := iw - margin
+		btnX -= 60
+		btnLoad.SetBounds(btnX, y, 60, editH)
+		btnX -= 68 + smallGap
+		btnDelete.SetBounds(btnX, y, 68, editH)
+		btnX -= 72 + smallGap
+		btnRename.SetBounds(btnX, y, 72, editH)
+		btnX -= 72 + smallGap
+		btnSaveAs.SetBounds(btnX, y, 72, editH)
+
+		y += editH + smallGap
+
+		// ── Row 2: master controls ──
+		masterLbl.SetBounds(margin, y+4, 55, labelH)
+		gainLbl.SetBounds(margin+55, y+4, 36, labelH)
+		ws.gain.SetBounds(margin+91, y, 70, editH)
+		velAmpLbl.SetBounds(margin+171, y+4, 66, labelH)
+		ws.velAmp.SetBounds(margin+237, y, 70, editH)
+		velFiltLbl.SetBounds(margin+317, y+4, 76, labelH)
+		ws.velFilt.SetBounds(margin+393, y, 70, editH)
+
+		y += editH + smallGap
+
+		// ── Bottom-anchored: buttons ──
+		barY := ih - botMargin - btnH
+
+		// ── Preview label + box fill the space between tabs and bottom bar ──
+		const tabH = 200
+		tabs.SetBounds(margin, y, iw-2*margin, tabH)
 		cx, cy, cw, chh := tabs.ContentBounds()
 		for _, p := range panels {
 			p.SetBounds(cx+2, cy+2, cw-4, chh-4)
 		}
+		y += tabH + smallGap
 
-		masterY := tabY + tabH + 10
-		masterLbl.SetBounds(margin, masterY+4, 60, labelH)
+		prevLbl.SetBounds(margin, y, 200, labelH)
+		y += labelH + 2
 
-		gainLbl.SetBounds(margin+60, masterY+4, 40, labelH)
-		ws.gain.SetBounds(margin+100, masterY, 80, editH)
-
-		velAmpLbl.SetBounds(margin+200, masterY+4, 70, labelH)
-		ws.velAmp.SetBounds(margin+270, masterY, 80, editH)
-
-		velFiltLbl.SetBounds(margin+370, masterY+4, 80, labelH)
-		ws.velFilt.SetBounds(margin+450, masterY, 80, editH)
-
-		prevY := masterY + editH + 10
-		prevLbl.SetBounds(margin, prevY+2, 200, labelH)
-		prevY += labelH + 4
-
-		barY := ih - margin - btnH
-		prevH := barY - prevY - rowGap
+		prevH := barY - y - smallGap
 		if prevH < 60 {
 			prevH = 60
 		}
-		prevPb.SetBounds(margin, prevY, iw-2*margin, prevH)
+		prevPb.SetBounds(margin, y, iw-2*margin, prevH)
 
-		btnPreview.SetBounds(margin, barY, 130, btnH)
-		btnReset.SetBounds(margin+140, barY, 90, btnH)
+		btnPreview.SetBounds(margin, barY, 120, btnH)
+		btnReset.SetBounds(margin+120+smallGap, barY, 80, btnH)
 		btnClose.SetBounds(iw-margin-closeBtnW, barY, closeBtnW, btnH)
 	})
 
