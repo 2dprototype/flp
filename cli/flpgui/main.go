@@ -1,12 +1,3 @@
-// Command flp-gui is a desktop toolbox for FL Studio (.flp) project files.
-//
-// Features: semantic diff, project inspector, visualiser (with scroll),
-// channel / pattern / mixer browsers, git integration, and an editor.
-//
-// Usage:
-//
-//	flp-gui                 open with no project loaded
-//	flp-gui path/to/x.flp   open with that project preloaded
 package main
 
 import (
@@ -17,13 +8,976 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time" 
+	"sync"
+	"math"
 
 	"github.com/2dprototype/flp"
 	"github.com/2dprototype/wui"
 
 	"gitlab.com/gomidi/midi/v2"
 	"gitlab.com/gomidi/midi/v2/smf"
+	"github.com/gopxl/beep"
+	"github.com/gopxl/beep/speaker"
 )
+
+const (
+	synthSR       = beep.SampleRate(44100)
+	wavetableSize = 2048 // must be a power of two
+	wavetableMask = wavetableSize - 1
+)
+
+var speakerOnce sync.Once
+
+func ensureSpeakerInit() {
+	speakerOnce.Do(func() {
+		speaker.Init(synthSR, synthSR.N(time.Second/30))
+	})
+}
+
+// ───────────── wavetables ─────────────
+
+type wavetableSet struct {
+	sine, square, saw, triangle []float64
+}
+
+var wavetables = func() *wavetableSet {
+	w := &wavetableSet{
+		sine:     make([]float64, wavetableSize),
+		square:   make([]float64, wavetableSize),
+		saw:      make([]float64, wavetableSize),
+		triangle: make([]float64, wavetableSize),
+	}
+	for i := 0; i < wavetableSize; i++ {
+		phase := float64(i) / float64(wavetableSize)
+		w.sine[i] = math.Sin(2 * math.Pi * phase)
+		if phase < 0.5 {
+			w.square[i] = 1
+		} else {
+			w.square[i] = -1
+		}
+		w.saw[i] = 2*phase - 1
+		w.triangle[i] = 1 - 4*math.Abs(phase-0.5)
+	}
+	return w
+}()
+
+func (w *wavetableSet) table(name string) []float64 {
+	switch name {
+	case "square":
+		return w.square
+	case "saw":
+		return w.saw
+	case "triangle":
+		return w.triangle
+	default:
+		return w.sine
+	}
+}
+
+// ───────────── synth options ─────────────
+
+// SynthOptions is the complete parameter set of the built-in synthesizer.
+// It is passed by value and is safe to copy.
+type SynthOptions struct {
+	// ── Oscillators ──
+	Waveform1    string  // "sine" | "square" | "saw" | "triangle" | "noise"
+	Waveform2    string  // "off" | same values
+	Osc2Detune   float64 // semitones, -24..+24
+	Osc2Mix      float64 // 0..1
+	SubLevel     float64 // 0..1 (a sine one octave below osc1)
+	UnisonVoices int     // 1..7
+	UnisonDetune float64 // cents, 0..50
+
+	// ── Filter ──
+	FilterType     string  // "off" | "lp" | "hp" | "bp" | "notch"
+	FilterCutoff   float64 // Hz, 20..18000
+	FilterReso     float64 // Q, 0.5..20
+	FilterEnvAmt   float64 // octaves, -4..+4
+	FilterKeyTrack float64 // 0..1
+
+	// ── Filter envelope ──
+	FAttack  float64 // s
+	FDecay   float64 // s
+	FSustain float64 // 0..1
+	FRelease float64 // s
+
+	// ── Amp envelope ──
+	Attack  float64 // s
+	Decay   float64 // s
+	Sustain float64 // 0..1
+	Release float64 // s
+
+	// ── LFO ──
+	LFOShape  string  // "off" | "sine" | "tri" | "square" | "saw"
+	LFORate   float64 // Hz
+	LFODepth  float64 // 0..1
+	LFOTarget string  // "off" | "amp" | "filter"
+	LFOPitch  float64 // reserved for future pitch-mod (0 now)
+
+	// ── Effects ──
+	Drive      float64 // 0..1 pre-filter saturation
+	DelayTime  float64 // s, 0..1
+	DelayFeed  float64 // 0..0.9
+	DelayMix   float64 // 0..1
+	ReverbSize float64 // 0..1
+	ReverbMix  float64 // 0..1
+
+	// ── Master ──
+	Gain      float64 // 0..1
+	VelToAmp  float64 // 0..1
+	VelToFilt float64 // 0..1
+}
+
+func defaultSynthOptions() SynthOptions {
+	return SynthOptions{
+		// ── Oscillators: clean sine ──
+		Waveform1:    "sine",
+		Waveform2:    "off",
+		Osc2Detune:   0,
+		Osc2Mix:      0,
+		SubLevel:     0,
+		UnisonVoices: 1,
+		UnisonDetune: 0,
+
+		// ── Filter: fully open LP, no colouring ──
+		FilterType:     "lp",
+		FilterCutoff:   18000, // near-Nyquist, effectively bypassed
+		FilterReso:     0.707, // Butterworth — maximally flat
+		FilterEnvAmt:   0,     // no envelope movement
+		FilterKeyTrack: 0,
+
+		// ── Filter envelope: neutral ──
+		FAttack:  0.004,
+		FDecay:   0.30,
+		FSustain: 1.0,
+		FRelease: 0.20,
+
+		// ── Amp envelope: soft attack, natural decay, full sustain,
+		//    gentle release — a clean "pure tone" feel ──
+		Attack:  0.008,
+		Decay:   0.20,
+		Sustain: 0.85,
+		Release: 0.35,
+
+		// ── LFO: off ──
+		LFOShape:  "off",
+		LFORate:   5,
+		LFODepth:  0,
+		LFOTarget: "off",
+		LFOPitch:  0,
+
+		// ── Effects: no drive, no delay, no reverb ──
+		Drive:      0,
+		DelayTime:  0.25,
+		DelayFeed:  0,
+		DelayMix:   0,
+		ReverbSize: 0,
+		ReverbMix:  0,
+
+		// ── Master: conservative gain, no velocity colouring ──
+		Gain:      0.6,
+		VelToAmp:  0.7, // still responds to velocity but doesn't over-modulate
+		VelToFilt: 0,   // filter is fixed
+	}
+}
+
+// ───────────── shared synth config ─────────────
+
+// SynthConfig holds live synth parameters shared between the Visualizer and
+// the Settings modal. Safe for concurrent access.
+type SynthConfig struct {
+	mu   sync.RWMutex
+	opts SynthOptions
+}
+
+func NewSynthConfig() *SynthConfig {
+	return &SynthConfig{opts: defaultSynthOptions()}
+}
+
+func (c *SynthConfig) Snapshot() SynthOptions {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.opts
+}
+
+func (c *SynthConfig) Update(fn func(*SynthOptions)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fn(&c.opts)
+}
+
+func midiKeyToHz(key int) float64 {
+	return 440.0 * math.Pow(2.0, float64(key-69)/12.0)
+}
+
+// ───────────── pattern → PCM ─────────────
+
+// renderPattern renders a pattern with the full synth engine: multi-osc voices
+// with unison and sub, per-voice biquad filter with a dedicated envelope,
+// optional LFO modulation, and post effects (drive, delay, reverb).
+func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []float64 {
+	if ppq <= 0 {
+		ppq = 96
+	}
+	if bpm <= 0 {
+		bpm = 120
+	}
+	tps := bpm / 60.0 * float64(ppq)
+	spt := 1.0 / tps
+	sr := float64(synthSR)
+
+	// Buffer length: last note end + longest release + effects tail.
+	var maxTick uint32
+	for _, n := range pat.Notes {
+		if e := n.Position + n.Length; e > maxTick {
+			maxTick = e
+		}
+	}
+	filterActive := opt.FilterType != "off" && opt.FilterType != ""
+	tail := opt.Release
+	if filterActive && opt.FRelease > tail {
+		tail = opt.FRelease
+	}
+	if opt.DelayMix > 0.01 {
+		tail += opt.DelayTime * 4
+	}
+	if opt.ReverbMix > 0.01 {
+		tail += 2.0
+	}
+	totalSec := float64(maxTick)*spt + tail + 0.1
+	if totalSec < 0.2 {
+		totalSec = 0.2
+	}
+	buf := make([]float64, int(totalSec*sr))
+	if len(pat.Notes) == 0 {
+		return buf
+	}
+
+	// Waveform tables (nil = noise).
+	var table1, table2 []float64
+	if opt.Waveform1 != "noise" {
+		table1 = wavetables.table(opt.Waveform1)
+	}
+	osc2Active := opt.Waveform2 != "off" && opt.Waveform2 != "" && opt.Osc2Mix > 0.001
+	if osc2Active && opt.Waveform2 != "noise" {
+		table2 = wavetables.table(opt.Waveform2)
+	}
+	subTable := wavetables.sine
+
+	// Unison prep.
+	unisonVoices := opt.UnisonVoices
+	if unisonVoices < 1 {
+		unisonVoices = 1
+	}
+	if unisonVoices > 7 {
+		unisonVoices = 7
+	}
+	unisonAmp := 1.0
+	if unisonVoices > 1 {
+		unisonAmp = 1.0 / math.Sqrt(float64(unisonVoices))
+	}
+	osc1Mix := 1.0 - opt.Osc2Mix
+
+	// LFO active?
+	lfoActive := (opt.LFOShape == "sine" || opt.LFOShape == "tri" ||
+		opt.LFOShape == "square" || opt.LFOShape == "saw") &&
+		(opt.LFOTarget == "amp" || opt.LFOTarget == "filter")
+
+	// ── Voice renderer (closure captures everything above) ──
+	renderVoice := func(n flp.Note) {
+		if n.Length == 0 {
+			return
+		}
+		startSample := int(float64(n.Position) * spt * sr)
+		if startSample >= len(buf) {
+			return
+		}
+		noteSamples := maxInt(1, int(float64(n.Length)*spt*sr))
+		noteEnd := startSample + noteSamples
+		if noteEnd > len(buf) {
+			noteEnd = len(buf)
+		}
+
+		// Release window
+		relSec := opt.Release
+		if filterActive && opt.FRelease > relSec {
+			relSec = opt.FRelease
+		}
+		relSamples := int(relSec*sr) + 64
+		releaseEnd := noteEnd + relSamples
+		if releaseEnd > len(buf) {
+			releaseEnd = len(buf)
+		}
+
+		// Envelopes
+		ampEnv := newADSR(opt.Attack, opt.Decay, opt.Sustain, opt.Release, sr)
+		var filtEnv *adsr
+		if filterActive {
+			filtEnv = newADSR(opt.FAttack, opt.FDecay, opt.FSustain, opt.FRelease, sr)
+		}
+
+		// Velocity
+		vel := float64(n.Velocity) / 127.0
+		if vel <= 0 {
+			vel = 1
+		}
+		velAmp := (1 - opt.VelToAmp) + opt.VelToAmp*vel
+		velFilt := 1.0 + opt.VelToFilt*(vel-0.5)*2 // 0..2
+
+		// Frequencies
+		baseHz := midiKeyToHz(n.Key)
+		subIncr := baseHz * 0.5 * float64(wavetableSize) / sr
+		osc2Incr := baseHz * math.Pow(2, opt.Osc2Detune/12.0) * float64(wavetableSize) / sr
+
+		// Unison phase / increment arrays
+		unisonPhases := make([]float64, unisonVoices)
+		unisonIncrs := make([]float64, unisonVoices)
+		for u := 0; u < unisonVoices; u++ {
+			var cents float64
+			if unisonVoices > 1 {
+				t := float64(u)/float64(unisonVoices-1)*2 - 1
+				cents = t * opt.UnisonDetune
+			}
+			unisonIncrs[u] = baseHz * math.Pow(2, cents/1200.0) * float64(wavetableSize) / sr
+		}
+
+		var subPhase, osc2Phase float64
+
+		// Per-voice filter and state
+		var filt biquad
+		filtCountdown := 0
+
+		// LFO
+		lfoIncr := opt.LFORate / sr
+		lfoPhase := 0.0
+
+		// Per-voice RNG (deterministic noise)
+		noiseState := uint32(n.Position)*2654435761 + uint32(n.Key)*40503 + 1
+
+		for i := startSample; i < releaseEnd; i++ {
+			if i == noteEnd {
+				ampEnv.releaseFrom(opt.Release, sr)
+				if filtEnv != nil {
+					filtEnv.releaseFrom(opt.FRelease, sr)
+				}
+			}
+
+			ampVal := ampEnv.tick()
+			var filtVal float64
+			if filtEnv != nil {
+				filtVal = filtEnv.tick()
+			}
+			if ampEnv.done() {
+				break
+			}
+
+			// ── Oscillators ──
+			var osc float64
+			if table1 != nil {
+				var sum float64
+				for u := 0; u < unisonVoices; u++ {
+					idx := int(unisonPhases[u]) & wavetableMask
+					sum += table1[idx]
+					unisonPhases[u] += unisonIncrs[u]
+					if unisonPhases[u] >= wavetableSize {
+						unisonPhases[u] -= wavetableSize
+					}
+				}
+				osc = sum * unisonAmp
+			} else {
+			noiseState = noiseState*1664525 + 1013904223
+				osc = float64(int32(noiseState)) / float64(1<<31)
+			}
+
+			if osc2Active {
+				var v2 float64
+				if table2 != nil {
+					v2 = table2[int(osc2Phase)&wavetableMask]
+				} else {
+					noiseState = noiseState*1664525 + 1013904223
+					v2 = float64(int32(noiseState)) / float64(1<<31)
+				}
+				osc = osc*osc1Mix + v2*opt.Osc2Mix
+				osc2Phase += osc2Incr
+				if osc2Phase >= wavetableSize {
+					osc2Phase -= wavetableSize
+				}
+			}
+
+			if opt.SubLevel > 0.001 {
+				osc += subTable[int(subPhase)&wavetableMask] * opt.SubLevel
+				subPhase += subIncr
+				if subPhase >= wavetableSize {
+					subPhase -= wavetableSize
+				}
+			}
+
+			// ── Amp envelope ──
+			osc *= ampVal * velAmp
+
+			// ── LFO ──
+			var lfoVal float64
+			if lfoActive {
+				switch opt.LFOShape {
+				case "sine":
+					lfoVal = math.Sin(2 * math.Pi * lfoPhase)
+				case "tri":
+					lfoVal = 4*math.Abs(lfoPhase-0.5) - 1
+				case "square":
+					if lfoPhase < 0.5 {
+						lfoVal = 1
+					} else {
+						lfoVal = -1
+					}
+				case "saw":
+					lfoVal = 2*lfoPhase - 1
+				}
+				lfoVal *= opt.LFODepth
+				if opt.LFOTarget == "amp" {
+					osc *= 1 + lfoVal
+					if osc < 0 {
+						osc = 0
+					}
+				}
+				lfoPhase += lfoIncr
+				if lfoPhase >= 1 {
+					lfoPhase -= 1
+				}
+			}
+
+			// ── Filter ──
+			if filterActive {
+				if filtCountdown <= 0 {
+					fc := opt.FilterCutoff
+					if filtEnv != nil {
+						fc *= math.Pow(2, opt.FilterEnvAmt*filtVal)
+					}
+					if opt.FilterKeyTrack > 0.001 {
+						semitones := float64(n.Key - 60)
+						fc *= math.Pow(2, semitones*opt.FilterKeyTrack/12.0)
+					}
+					if lfoActive && opt.LFOTarget == "filter" {
+						fc *= math.Pow(2, lfoVal*3)
+					}
+					fc *= velFilt
+					filt.set(opt.FilterType, fc, opt.FilterReso, sr)
+					filtCountdown = 32
+				}
+				filtCountdown--
+				osc = filt.process(osc)
+			}
+
+			buf[i] += osc
+		}
+	}
+
+	for _, n := range pat.Notes {
+		renderVoice(n)
+	}
+
+	// ── Post: drive ──
+	if opt.Drive > 0.001 {
+		d := 1.0 + opt.Drive*15
+		for i, v := range buf {
+			buf[i] = math.Tanh(v * d)
+		}
+	}
+
+	// ── Post: delay ──
+	if opt.DelayMix > 0.001 && opt.DelayTime > 0.001 {
+		dl := newDelayLine(int(opt.DelayTime*sr) + 4)
+		ds := opt.DelayTime * sr
+		fb := opt.DelayFeed
+		if fb > 0.9 {
+			fb = 0.9
+		}
+		for i := range buf {
+			buf[i] = dl.process(buf[i], ds, fb, opt.DelayMix)
+		}
+	}
+
+	// ── Post: reverb ──
+	if opt.ReverbMix > 0.001 {
+		rv := newReverb()
+		for i := range buf {
+			buf[i] = rv.process(buf[i], opt.ReverbSize, opt.ReverbMix)
+		}
+	}
+
+	// ── Master gain + safety soft-clip ──
+	g := opt.Gain
+	if g <= 0 {
+		g = 1
+	}
+	for i, v := range buf {
+		buf[i] = math.Tanh(v * g)
+	}
+	return buf
+}
+
+// previewBuf renders a short two-note demo (C4, then G4) with the given
+// settings, truncated to durationSec.
+func previewBuf(cfg SynthOptions, durationSec float64) []float64 {
+	pat := flp.Pattern{
+		Notes: []flp.Note{
+			{Position: 0, Length: 48, Key: 60, Velocity: 100, ChannelIid: 0},
+			{Position: 48, Length: 96, Key: 67, Velocity: 110, ChannelIid: 0},
+		},
+	}
+	buf := renderPattern(pat, 96, 120, cfg)
+	n := int(durationSec * float64(synthSR))
+	if n > 0 && len(buf) > n {
+		buf = buf[:n]
+	}
+	return buf
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ───────────── envelope ─────────────
+
+type adsrPhase int
+
+const (
+	adsrAttack adsrPhase = iota
+	adsrDecay
+	adsrSustain
+	adsrRelease
+	adsrDone
+)
+
+// adsr is a per-sample linear envelope. Release time is set at release time
+// (so a note released early still takes the same wall-clock time to fade).
+type adsr struct {
+	phase      adsrPhase
+	value      float64
+	attackInc  float64
+	decayInc   float64
+	sustain    float64
+	releaseInc float64
+}
+
+func newADSR(a, d, s, r, sr float64) *adsr {
+	if a < 0.0005 {
+		a = 0.0005
+	}
+	if d < 0.0005 {
+		d = 0.0005
+	}
+	if r < 0.0005 {
+		r = 0.0005
+	}
+	return &adsr{
+		phase:      adsrAttack,
+		attackInc:  1.0 / (a * sr),
+		decayInc:   (1.0 - s) / (d * sr),
+		sustain:    s,
+		releaseInc: 0, // set on release
+	}
+}
+
+func (e *adsr) tick() float64 {
+	switch e.phase {
+	case adsrAttack:
+		e.value += e.attackInc
+		if e.value >= 1 {
+			e.value = 1
+			e.phase = adsrDecay
+		}
+	case adsrDecay:
+		e.value -= e.decayInc
+		if e.value <= e.sustain {
+			e.value = e.sustain
+			e.phase = adsrSustain
+		}
+	case adsrRelease:
+		e.value -= e.releaseInc
+		if e.value <= 0 {
+			e.value = 0
+			e.phase = adsrDone
+		}
+	}
+	return e.value
+}
+
+func (e *adsr) releaseFrom(seconds, sr float64) {
+	if e.phase == adsrDone || e.phase == adsrRelease {
+		return
+	}
+	if seconds < 0.0005 {
+		seconds = 0.0005
+	}
+	e.releaseInc = e.value / (seconds * sr)
+	e.phase = adsrRelease
+}
+
+func (e *adsr) done() bool { return e.phase == adsrDone }
+
+// ───────────── biquad filter (RBJ cookbook, TDF-II) ─────────────
+
+type biquad struct {
+	b0, b1, b2, a1, a2 float64
+	x1, x2, y1, y2     float64
+}
+
+func (f *biquad) reset() { f.x1, f.x2, f.y1, f.y2 = 0, 0, 0, 0 }
+
+func (f *biquad) process(x float64) float64 {
+	y := f.b0*x + f.b1*f.x1 + f.b2*f.x2 - f.a1*f.y1 - f.a2*f.y2
+	f.x2, f.x1 = f.x1, x
+	f.y2, f.y1 = f.y1, y
+	return y
+}
+
+// set computes coefficients. kind is "lp" | "hp" | "bp" | "notch".
+func (f *biquad) set(kind string, fc, q, sr float64) {
+	if fc < 20 {
+		fc = 20
+	}
+	if fc > sr*0.48 {
+		fc = sr * 0.48
+	}
+	if q < 0.05 {
+		q = 0.05
+	}
+	w0 := 2 * math.Pi * fc / sr
+	cosW := math.Cos(w0)
+	sinW := math.Sin(w0)
+	alpha := sinW / (2 * q)
+
+	var b0, b1, b2, a0, a1, a2 float64
+	switch kind {
+	case "hp":
+		b0 = (1 + cosW) / 2
+		b1 = -(1 + cosW)
+		b2 = (1 + cosW) / 2
+		a0 = 1 + alpha
+		a1 = -2 * cosW
+		a2 = 1 - alpha
+	case "bp":
+		b0 = alpha
+		b1 = 0
+		b2 = -alpha
+		a0 = 1 + alpha
+		a1 = -2 * cosW
+		a2 = 1 - alpha
+	case "notch":
+		b0 = 1
+		b1 = -2 * cosW
+		b2 = 1
+		a0 = 1 + alpha
+		a1 = -2 * cosW
+		a2 = 1 - alpha
+	default: // lp
+		b0 = (1 - cosW) / 2
+		b1 = 1 - cosW
+		b2 = (1 - cosW) / 2
+		a0 = 1 + alpha
+		a1 = -2 * cosW
+		a2 = 1 - alpha
+	}
+	inv := 1 / a0
+	f.b0, f.b1, f.b2 = b0*inv, b1*inv, b2*inv
+	f.a1, f.a2 = a1*inv, a2*inv
+}
+
+// ───────────── effects ─────────────
+
+// delayLine is a single-tap feedback delay with dry/wet mix.
+type delayLine struct {
+	buf  []float64
+	pos  int
+	size int
+}
+
+func newDelayLine(n int) *delayLine {
+	if n < 2 {
+		n = 2
+	}
+	return &delayLine{buf: make([]float64, n), size: n}
+}
+
+func (d *delayLine) process(x, delaySamples, feedback, mix float64) float64 {
+	ds := int(delaySamples)
+	if ds < 1 {
+		ds = 1
+	}
+	if ds >= d.size {
+		ds = d.size - 1
+	}
+	readPos := d.pos - ds
+	if readPos < 0 {
+		readPos += d.size
+	}
+	delayed := d.buf[readPos]
+	d.buf[d.pos] = x + delayed*feedback
+	d.pos++
+	if d.pos >= d.size {
+		d.pos = 0
+	}
+	return x*(1-mix) + delayed*mix
+}
+
+// comb + allpass are the building blocks of a Schroeder / Freeverb reverb.
+type comb struct {
+	buf         []float64
+	pos         int
+	size        int
+	filterStore float64
+}
+
+func newComb(n int) *comb { return &comb{buf: make([]float64, n), size: n} }
+
+func (c *comb) process(x, feedback, damp float64) float64 {
+	out := c.buf[c.pos]
+	c.filterStore = out*(1-damp) + c.filterStore*damp
+	c.buf[c.pos] = x + c.filterStore*feedback
+	c.pos++
+	if c.pos >= c.size {
+		c.pos = 0
+	}
+	return out
+}
+
+type allpass struct {
+	buf  []float64
+	pos  int
+	size int
+}
+
+func newAllpass(n int) *allpass { return &allpass{buf: make([]float64, n), size: n} }
+
+func (a *allpass) process(x, feedback float64) float64 {
+	bufout := a.buf[a.pos]
+	out := -x + bufout
+	a.buf[a.pos] = x + bufout*feedback
+	a.pos++
+	if a.pos >= a.size {
+		a.pos = 0
+	}
+	return out
+}
+
+// reverb is a mono 8-comb, 4-allpass Freeverb (tunings for 44.1 kHz).
+type reverb struct {
+	combs     [8]*comb
+	allpasses [4]*allpass
+}
+
+func newReverb() *reverb {
+	return &reverb{
+		combs: [8]*comb{
+			newComb(1116), newComb(1188), newComb(1277), newComb(1356),
+			newComb(1422), newComb(1491), newComb(1557), newComb(1617),
+		},
+		allpasses: [4]*allpass{
+			newAllpass(556), newAllpass(441), newAllpass(341), newAllpass(225),
+		},
+	}
+}
+
+func (r *reverb) process(x, size, mix float64) float64 {
+	if mix < 0.001 {
+		return x
+	}
+	feedback := 0.70 + size*0.28
+	damp := 0.20
+
+	var wet float64
+	for _, c := range r.combs {
+		wet += c.process(x, feedback, damp)
+	}
+	wet *= 0.125
+	for _, a := range r.allpasses {
+		wet = a.process(wet, 0.5)
+	}
+	return x*(1-mix) + wet*mix
+}
+
+// ───────────── streamer ─────────────
+
+// positionStreamer plays a mono buffer and reports its position in samples.
+// It is safe to call Position() concurrently with Stream().
+type positionStreamer struct {
+	buf   []float64
+	pos   int
+	mu    sync.Mutex
+	ended bool
+	onEnd func()
+}
+
+func (s *positionStreamer) Stream(samples [][2]float64) (int, bool) {
+	s.mu.Lock()
+	n := 0
+	for i := range samples {
+		if s.pos >= len(s.buf) {
+			break
+		}
+		v := s.buf[s.pos]
+		samples[i][0] = v
+		samples[i][1] = v
+		s.pos++
+		n++
+	}
+	done := s.pos >= len(s.buf)
+	fireEnd := done && !s.ended
+	if fireEnd {
+		s.ended = true
+	}
+	cb := s.onEnd
+	s.mu.Unlock()
+
+	if fireEnd && cb != nil {
+		go cb()
+	}
+	if n == 0 && done {
+		return 0, false
+	}
+	return n, true
+}
+
+func (s *positionStreamer) Err() error { return nil }
+
+func (s *positionStreamer) Position() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pos
+}
+
+// SeekTo moves the playback head to pos (clamped to [0, len(buf)]).
+// Safe to call concurrently with Stream().
+func (s *positionStreamer) SeekTo(pos int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(s.buf) {
+		pos = len(s.buf)
+	}
+	s.pos = pos
+	s.ended = false
+}
+
+// ───────────── player ─────────────
+
+type MIDIPlayer struct {
+	mu         sync.Mutex
+	stream     *positionStreamer
+	playing    bool
+	reachedEnd bool
+	ppq        int
+	bpm        float64
+}
+
+func NewMIDIPlayer() *MIDIPlayer { return &MIDIPlayer{} }
+
+// PlayPattern renders pat and starts playing it through the speaker.
+// Any currently playing pattern is stopped first.
+func (p *MIDIPlayer) PlayPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions, startTick uint32) {
+	ensureSpeakerInit()
+
+	buf := renderPattern(pat, ppq, bpm, opt)
+	stream := &positionStreamer{buf: buf}
+
+	// Seek to the requested start tick (or clamp to 0 if past the end).
+	if bpm > 0 && ppq > 0 {
+		tps := bpm / 60.0 * float64(ppq)
+		if tps > 0 {
+			pos := int(float64(startTick) / tps * float64(synthSR))
+			if pos < 0 || pos > len(buf) {
+				pos = 0
+			}
+			stream.pos = pos
+		}
+	}
+
+	stream.onEnd = func() {
+		p.mu.Lock()
+		if p.stream == stream {
+			p.playing = false
+			p.stream = nil
+			p.reachedEnd = true
+		}
+		p.mu.Unlock()
+	}
+
+	p.mu.Lock()
+	p.stream = stream
+	p.playing = true
+	p.reachedEnd = false
+	p.ppq = ppq
+	p.bpm = bpm
+	p.mu.Unlock()
+
+	speaker.Clear()
+	speaker.Play(stream)
+}
+
+func (p *MIDIPlayer) Stop() {
+	p.mu.Lock()
+	playing := p.playing
+	p.playing = false
+	p.stream = nil
+	p.mu.Unlock()
+	if playing {
+		speaker.Clear()
+	}
+}
+
+func (p *MIDIPlayer) IsPlaying() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.playing
+}
+
+// TickPosition returns the current playback position in pattern ticks.
+func (p *MIDIPlayer) TickPosition() uint32 {
+	p.mu.Lock()
+	s := p.stream
+	ppq := p.ppq
+	bpm := p.bpm
+	p.mu.Unlock()
+	if s == nil {
+		return 0
+	}
+	tps := bpm / 60.0 * float64(ppq)
+	if tps <= 0 {
+		return 0
+	}
+	return uint32(float64(s.Position()) / float64(synthSR) * tps)
+}
+
+// SeekToTick moves the playback head to the given tick.
+func (p *MIDIPlayer) SeekToTick(tick uint32) {
+	p.mu.Lock()
+	s := p.stream
+	ppq := p.ppq
+	bpm := p.bpm
+	p.mu.Unlock()
+	if s == nil {
+		return
+	}
+	tps := bpm / 60.0 * float64(ppq)
+	if tps <= 0 {
+		return
+	}
+	sample := int(float64(tick) / tps * float64(synthSR))
+	s.SeekTo(sample)
+}
+
+// ReachedEnd reports whether the last playback stopped by itself.
+func (p *MIDIPlayer) ReachedEnd() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reachedEnd
+}
 
 // ───────────────────────── constants & state ─────────────────────────
 
@@ -108,6 +1062,8 @@ type AppState struct {
 }
 
 var app AppState
+
+var globalSynth = NewSynthConfig()
 
 // ───────────────────────── text & ui helpers ─────────────────────────
 
@@ -317,6 +1273,86 @@ func formatErr(err error) string {
 	return "Error: " + err.Error()
 }
 
+// ───────────────────────── timestamps ─────────────────────────
+
+// timestampRows returns [label, value] pairs for every timestamp we can
+// recover: FL Studio's embedded creation time and time-spent counter, plus
+// the on-disk modification time and file size.
+func timestampRows(p *flp.FLPProject, path string) [][2]string {
+	rows := [][2]string{}
+
+	if p != nil && p.Metadata.CreatedOn != nil {
+		rows = append(rows, [2]string{
+			"Created (in FL Studio)",
+			p.Metadata.CreatedOn.Local().Format("2006-01-02 15:04:05"),
+		})
+	}
+	if p != nil && p.Metadata.TimeSpentSeconds != nil {
+		d := time.Duration(*p.Metadata.TimeSpentSeconds * float64(time.Second))
+		rows = append(rows, [2]string{
+			"Time spent (FL Studio)",
+			formatDuration(d),
+		})
+	}
+	if path != "" {
+		if st, err := os.Stat(path); err == nil {
+			rows = append(rows, [2]string{
+				"File modified",
+				st.ModTime().Local().Format("2006-01-02 15:04:05"),
+			})
+			rows = append(rows, [2]string{
+				"File size",
+				formatBytes(st.Size()),
+			})
+		} else {
+			rows = append(rows, [2]string{"File", "stat failed: " + err.Error()})
+		}
+	}
+	return rows
+}
+
+// timestampsText renders the timestamp rows as a plain multi-line string,
+// suitable for a text box.
+func timestampsText(p *flp.FLPProject, path string) string {
+	rows := timestampRows(p, path)
+	if len(rows) == 0 {
+		return "(no timestamps available)"
+	}
+	var b strings.Builder
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%-26s %s\n", r[0]+":", r[1])
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh %dm %ds", h, m, s)
+	case m > 0:
+		return fmt.Sprintf("%dm %ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
+	}
+}
+
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 func marshalIndentedJSON(v interface{}) (string, error) {
 	var b strings.Builder
 	enc := json.NewEncoder(&b)
@@ -404,6 +1440,7 @@ func newMainWindow() *wui.Window {
 		{"Pattern Browser", openPatternTool},
 		{"Mixer Browser", openMixerTool},
 		{"Asset Viewer", openAssetTool},
+		{"Synthesizer", openSynthSettingsTool},
 		{"Git Integration", openGitTool},
 		{"About", openAboutTool},
 	}
@@ -419,11 +1456,12 @@ func newMainWindow() *wui.Window {
 	app.OnUpdate = func() {
 		dashPaint.Paint()
 		for _, b := range btns {
-			// Require project for most tools, except About, Diff, Git.
-			if app.Project == nil && b.Text() != "Diff Two Projects" && b.Text() != "About" && b.Text() != "Git Integration" {
-				b.SetEnabled(false)
-			} else {
+			// Require project for most tools, except the project-independent ones.
+			switch b.Text() {
+			case "Diff Two Projects", "About", "Git Integration", "Synthesizer":
 				b.SetEnabled(true)
+			default:
+				b.SetEnabled(app.Project != nil)
 			}
 		}
 	}
@@ -477,7 +1515,17 @@ func newMainWindow() *wui.Window {
 		y := 90
 		for _, stat := range stats {
 			c.TextOut(40, y, stat, colText)
-			y += 30
+			y += 26
+		}
+
+		y += 10
+		c.TextOut(40, y, "Timestamps", colTextDim)
+		y += 24
+
+		for _, row := range timestampRows(app.Project, app.Path) {
+			c.TextOut(40, y, row[0]+":", colTextDim)
+			c.TextOut(240, y, row[1], colText)
+			y += 22
 		}
 	})
 
@@ -490,10 +1538,10 @@ func newMainWindow() *wui.Window {
 
 		btnLoad.SetBounds(sidebarW+40, ih-80, 160, 40)
 
-		y := 60
+		y := 56
 		for _, b := range btns {
-			b.SetBounds(margin, y, sidebarW-2*margin, 35)
-			y += 40
+			b.SetBounds(margin, y, sidebarW-2*margin, 32)
+			y += 36
 		}
 	})
 
@@ -1344,7 +2392,8 @@ func openInspectTool(_ *wui.Window) {
 			}
 			setText(out, trimForUI(s))
 		default:
-			setText(out, flp.RenderInfo(app.Project, app.Path))
+			header := timestampsText(app.Project, app.Path) + "\n\n"
+			setText(out, header+flp.RenderInfo(app.Project, app.Path))
 		}
 	}
 	btnShow.SetOnClick(updateOutput)
@@ -1375,6 +2424,27 @@ type vizState struct {
 	dragStartScrollY int
 
 	patternIdx int
+
+	player     *MIDIPlayer
+	playTimer  *wui.Timer
+	manualTick uint32
+	synth      *SynthConfig
+}
+
+// scrubToTick updates the playhead position (and seeks the audio if playing).
+func (s *vizState) scrubToTick(tick uint32) {
+	if s.player != nil && s.player.IsPlaying() {
+		s.player.SeekToTick(tick)
+	}
+	s.manualTick = tick
+}
+
+// currentTick returns the tick at which the playhead should be drawn.
+func (s *vizState) currentTick() uint32 {
+	if s.player != nil && s.player.IsPlaying() {
+		return s.player.TickPosition()
+	}
+	return s.manualTick
 }
 
 func openVisualizerTool(_ *wui.Window) {
@@ -1408,6 +2478,9 @@ func openVisualizerTool(_ *wui.Window) {
 	btnExportMIDI := newBtn("Export MIDI", 0, 0, 100, editH, nil)
 	w.Add(btnExportMIDI)
 
+	btnPlay := newBtn("Play", 0, 0, 70, editH, nil)
+	w.Add(btnPlay)
+
 	pb := wui.NewPaintBox()
 	w.Add(pb)
 
@@ -1421,6 +2494,8 @@ func openVisualizerTool(_ *wui.Window) {
 		zoomX:      1,
 		zoomY:      1,
 		patternIdx: 0,
+		player:     NewMIDIPlayer(),
+		synth:      globalSynth,
 	}
 
 	patItems := make([]string, len(s.project.Patterns))
@@ -1451,6 +2526,8 @@ func openVisualizerTool(_ *wui.Window) {
 		right := margin + contentW
 		btnExportMIDI.SetBounds(right-100, y, 100, editH)
 		right -= 100 + 8
+		btnPlay.SetBounds(right-70, y, 70, editH)
+		right -= 70 + 8
 		btnFit.SetBounds(right-40, y, 40, editH)
 		right -= 40 + 6
 		btnZoomIn.SetBounds(right-28, y, 28, editH)
@@ -1483,7 +2560,33 @@ func openVisualizerTool(_ *wui.Window) {
 		renderViz(c, s)
 	})
 
+	// Playback repaint timer — only runs while playing.
+	s.playTimer = w.AddTimer(16, func() {
+		if s.player == nil || !s.player.IsPlaying() {
+			btnPlay.SetText("Play")
+			s.playTimer.Stop()
+			if s.player != nil && s.player.ReachedEnd() {
+				s.manualTick = 0
+			}
+			pb.Paint()
+			return
+		}
+		pb.Paint()
+	})
+	s.playTimer.Stop()
+
+	stopPlayback := func() {
+		if s.player != nil && s.player.IsPlaying() {
+			s.manualTick = s.player.TickPosition()
+			s.player.Stop()
+			btnPlay.SetText("Play")
+			s.playTimer.Stop()
+			pb.Paint()
+		}
+	}
+
 	cmb.SetOnChange(func(_ int) {
+		stopPlayback()
 		s.view = cmb.Items()[cmb.SelectedIndex()]
 		s.scrollX, s.scrollY = 0, 0
 		if s.view == "pianoroll" {
@@ -1496,7 +2599,9 @@ func openVisualizerTool(_ *wui.Window) {
 		if i < 0 {
 			return
 		}
+		stopPlayback()
 		s.patternIdx = i
+		s.manualTick = 0
 		if s.view == "pianoroll" {
 			centerPianoRoll(s)
 			s.scrollX = 0
@@ -1522,6 +2627,28 @@ func openVisualizerTool(_ *wui.Window) {
 		s.zoomX, s.zoomY = 1, 1
 		s.scrollX, s.scrollY = 0, 0
 		pb.Paint()
+	})
+
+	btnPlay.SetOnClick(func() {
+		if s.player.IsPlaying() {
+			stopPlayback()
+			return
+		}
+		if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+			return
+		}
+		pat := s.project.Patterns[s.patternIdx]
+		bpm := 120.0
+		if t := flp.GetTempo(s.project); t != nil {
+			bpm = *t
+		}
+		ppq := s.project.Header.PPQ
+		if ppq <= 0 {
+			ppq = 96
+		}
+		s.player.PlayPattern(pat, ppq, bpm, s.synth.Snapshot(), s.manualTick)
+		btnPlay.SetText("Stop")
+		s.playTimer.Start()
 	})
 
 	w.SetOnMouseWheel(func(x, y int, delta float64) {
@@ -1568,6 +2695,8 @@ func openVisualizerTool(_ *wui.Window) {
 				s.zoomX /= 1.25
 			}
 			clampScroll(s)
+		case wui.KeySpace:
+			btnPlay.OnClick()()
 		default:
 			return
 		}
@@ -1580,6 +2709,10 @@ func openVisualizerTool(_ *wui.Window) {
 		lx, ly := x-px, y-py
 		if handleScrollClick(s, lx, ly) {
 			pb.Paint()
+			return
+		}
+		if handlePianoRollScrub(s, lx, ly) {
+			pb.Paint()
 		}
 	})
 	w.SetOnMouseUp(func(_ wui.MouseButton, x, y int) {
@@ -1587,6 +2720,12 @@ func openVisualizerTool(_ *wui.Window) {
 	})
 	pb.SetOnMouseMove(func(x, y int) {
 		if s.dragMode == 0 {
+			return
+		}
+		if s.dragMode == 3 {
+			if handlePianoRollScrub(s, x, y) {
+				pb.Paint()
+			}
 			return
 		}
 		if handleScrollDrag(s, x, y) {
@@ -1607,7 +2746,31 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	})
 
+	defer stopPlayback()
 	showModal(w)
+}
+
+// handlePianoRollScrub converts a mouse coordinate inside the piano roll into
+// a tick position and updates the playhead. Returns true if the click landed
+// inside the scrub area.
+func handlePianoRollScrub(s *vizState, lx, ly int) bool {
+	if s.view != "pianoroll" {
+		return false
+	}
+	if lx < pianoKeysW || lx >= s.pbW-scrollbarSize {
+		return false
+	}
+	if ly < vizHeaderH+rulerH || ly >= s.pbH-scrollbarSize {
+		return false
+	}
+	pxPerTick := basePxPerTick * s.zoomX
+	tick := float64(lx-pianoKeysW+s.scrollX) / pxPerTick
+	if tick < 0 {
+		tick = 0
+	}
+	s.scrubToTick(uint32(tick))
+	s.dragMode = 3
+	return true
 }
 
 func centerPianoRoll(s *vizState) {
@@ -2161,6 +3324,24 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		col := noteColor(p, n.ChannelIid)
 		c.FillRect(x, y+1, nw, keyH-2, col)
 		c.DrawRect(x, y+1, nw, keyH-2, colClipEdge)
+	}
+
+	// ── playback cursor ────────────────────────────────────────────
+	// Always drawn: shows the scrub position when idle, live position when
+	// playing. The user can click/drag anywhere in the grid to reposition.
+	var pos uint32
+	if s.player != nil && s.player.IsPlaying() {
+		pos = s.player.TickPosition()
+	} else {
+		pos = s.manualTick
+	}
+	cx := pianoKeysW + int(float64(pos)*pxPerTick) - s.scrollX
+	if cx >= pianoKeysW && cx <= s.vpW {
+		cursorCol := wui.RGB(220, 60, 60)
+		c.Line(cx, gridTop, cx, gridBottom, cursorCol)
+		// Triangular cap in the ruler so it's easy to spot and grab.
+		c.FillRect(cx-4, contentY+rulerH-9, 9, 9, cursorCol)
+		c.Line(cx-4, contentY+rulerH, cx+5, contentY+rulerH, colSep)
 	}
 }
 
@@ -2905,6 +4086,12 @@ func openAssetTool(_ *wui.Window) {
 			fmt.Fprintf(&b, "Time signature: %d/%d\n",
 				*p.Metadata.TimeSignatureNumerator, *p.Metadata.TimeSignatureDenominator)
 		}
+
+		// ── timestamps ──
+		b.WriteString("\n")
+		b.WriteString(timestampsText(p, app.Path))
+		b.WriteString("\n")
+
 		fmt.Fprintf(&b, "\nChannels:       %d\n", len(p.Channels))
 		fmt.Fprintf(&b, "Patterns:       %d\n", len(p.Patterns))
 		fmt.Fprintf(&b, "Mixer inserts:  %d\n", len(p.Inserts))
@@ -3236,4 +4423,520 @@ func openAssetTool(_ *wui.Window) {
 	})
 
 	showModal(w)
+}
+
+// ───────────── synth GUI helpers ─────────────
+
+type ctrlAdder interface {
+	Add(c wui.Control)
+}
+
+func addSynthHeader(parent ctrlAdder, x, y, w int, text string) {
+	lbl := wui.NewLabel()
+	lbl.SetText(text)
+	lbl.SetBounds(x, y, w, labelH)
+	if fontBold != nil {
+		lbl.SetFont(fontBold)
+	}
+	parent.Add(lbl)
+}
+
+func addSynthFloat(parent ctrlAdder, x, y, labelW, editW int, label string,
+	min, max float64, prec int, initial float64, onChange func(float64)) *wui.FloatUpDown {
+	lbl := wui.NewLabel()
+	lbl.SetText(label)
+	lbl.SetBounds(x, y+4, labelW, labelH)
+	if fontNormal != nil {
+		lbl.SetFont(fontNormal)
+	}
+	parent.Add(lbl)
+
+	up := wui.NewFloatUpDown()
+	up.SetBounds(x+labelW, y, editW, editH)
+	up.SetMinMax(min, max)
+	up.SetPrecision(prec)
+	up.SetValue(initial)
+	up.SetOnValueChange(onChange)
+	parent.Add(up)
+	return up
+}
+
+func addSynthInt(parent ctrlAdder, x, y, labelW, editW int, label string,
+	min, max, initial int, onChange func(int)) *wui.IntUpDown {
+	lbl := wui.NewLabel()
+	lbl.SetText(label)
+	lbl.SetBounds(x, y+4, labelW, labelH)
+	if fontNormal != nil {
+		lbl.SetFont(fontNormal)
+	}
+	parent.Add(lbl)
+
+	up := wui.NewIntUpDown()
+	up.SetBounds(x+labelW, y, editW, editH)
+	up.SetMinMax(min, max)
+	up.SetValue(initial)
+	up.SetOnValueChange(onChange)
+	parent.Add(up)
+	return up
+}
+
+func addSynthCombo(parent ctrlAdder, x, y, labelW, editW int, label string,
+	items []string, selected int, onChange func(int)) *wui.ComboBox {
+	lbl := wui.NewLabel()
+	lbl.SetText(label)
+	lbl.SetBounds(x, y+4, labelW, labelH)
+	if fontNormal != nil {
+		lbl.SetFont(fontNormal)
+	}
+	parent.Add(lbl)
+
+	cmb := wui.NewComboBox()
+	cmb.SetBounds(x+labelW, y, editW, editH)
+	cmb.SetItems(items)
+	if selected >= 0 && selected < len(items) {
+		cmb.SetSelectedIndex(selected)
+	} else {
+		cmb.SetSelectedIndex(0)
+	}
+	cmb.SetOnChange(onChange)
+	if fontNormal != nil {
+		cmb.SetFont(fontNormal)
+	}
+	parent.Add(cmb)
+	return cmb
+}
+
+// ───────────────────────── 11. Synthesizer Settings ─────────────────────────
+
+func openSynthSettingsTool(_ *wui.Window) {
+	w := newModal("Synthesizer")
+
+	initial := globalSynth.Snapshot()
+
+	// ── Preview cache (invalidated on any change) ──
+	var (
+		previewBufCache []float64
+		previewCfg      SynthOptions
+		previewValid    bool
+	)
+	getPreview := func() []float64 {
+		cfg := globalSynth.Snapshot()
+		if !previewValid || cfg != previewCfg {
+			previewBufCache = previewBuf(cfg, 1.0)
+			previewCfg = cfg
+			previewValid = true
+		}
+		return previewBufCache
+	}
+
+	// ── Preview paint box (declared up front so sync() can call Paint) ──
+	prevPb := wui.NewPaintBox()
+	w.Add(prevPb)
+	prevPb.SetOnPaint(func(c *wui.Canvas) {
+		cw, ch := c.Size()
+		c.FillRect(0, 0, cw, ch, wui.RGB(22, 26, 32))
+		if cw < 2 || ch < 8 {
+			return
+		}
+		centerY := ch / 2
+		c.Line(0, centerY, cw, centerY, wui.RGB(46, 52, 62))
+		c.Line(0, centerY-ch/4, cw, centerY-ch/4, wui.RGB(34, 40, 48))
+		c.Line(0, centerY+ch/4, cw, centerY+ch/4, wui.RGB(34, 40, 48))
+
+		buf := getPreview()
+		if len(buf) == 0 {
+			return
+		}
+		scale := float64(ch) / 2 * 0.92
+		samplesPerCol := float64(len(buf)) / float64(cw)
+		if samplesPerCol < 1 {
+			samplesPerCol = 1
+		}
+		fill := wui.RGB(70, 180, 110)
+		edge := wui.RGB(120, 230, 160)
+		for x := 0; x < cw; x++ {
+			start := int(float64(x) * samplesPerCol)
+			end := int(float64(x+1) * samplesPerCol)
+			if start >= len(buf) {
+				break
+			}
+			if end > len(buf) {
+				end = len(buf)
+			}
+			mn, mx := 0.0, 0.0
+			for i := start; i < end; i++ {
+				v := buf[i]
+				if v < mn {
+					mn = v
+				}
+				if v > mx {
+					mx = v
+				}
+			}
+			y0 := centerY - int(mx*scale)
+			y1 := centerY - int(mn*scale)
+			if y1 <= y0 {
+				y1 = y0 + 1
+			}
+			c.Line(x, y0, x, y1, fill)
+			c.Line(x, y0, x, y0, edge)
+		}
+		c.Line(0, ch-1, cw, ch-1, wui.RGB(50, 58, 68))
+	})
+
+	// ── Widget set ──
+	type widgetSet struct {
+		wave1, wave2                  *wui.ComboBox
+		osc2Detune, osc2Mix, subLevel *wui.FloatUpDown
+		unisonVoices                  *wui.IntUpDown
+		unisonDetune                  *wui.FloatUpDown
+
+		filtType                         *wui.ComboBox
+		filtCutoff, filtReso             *wui.FloatUpDown
+		filtEnvAmt, filtKeyTrack         *wui.FloatUpDown
+
+		aA, aD, aS, aR *wui.FloatUpDown
+		fA, fD, fS, fR *wui.FloatUpDown
+
+		lfoShape, lfoTarget         *wui.ComboBox
+		lfoRate, lfoDepth, lfoPitch *wui.FloatUpDown
+
+		drive                    *wui.FloatUpDown
+		delTime, delFeed, delMix *wui.FloatUpDown
+		revSize, revMix          *wui.FloatUpDown
+
+		gain, velAmp, velFilt *wui.FloatUpDown
+	}
+	var ws widgetSet
+
+	sync := func() {
+		globalSynth.Update(func(o *SynthOptions) {
+			o.Waveform1 = ws.wave1.Items()[ws.wave1.SelectedIndex()]
+			o.Waveform2 = ws.wave2.Items()[ws.wave2.SelectedIndex()]
+			o.Osc2Detune = ws.osc2Detune.Value()
+			o.Osc2Mix = ws.osc2Mix.Value()
+			o.SubLevel = ws.subLevel.Value()
+			o.UnisonVoices = ws.unisonVoices.Value()
+			o.UnisonDetune = ws.unisonDetune.Value()
+
+			o.FilterType = ws.filtType.Items()[ws.filtType.SelectedIndex()]
+			o.FilterCutoff = ws.filtCutoff.Value()
+			o.FilterReso = ws.filtReso.Value()
+			o.FilterEnvAmt = ws.filtEnvAmt.Value()
+			o.FilterKeyTrack = ws.filtKeyTrack.Value()
+
+			o.Attack = ws.aA.Value()
+			o.Decay = ws.aD.Value()
+			o.Sustain = ws.aS.Value()
+			o.Release = ws.aR.Value()
+			o.FAttack = ws.fA.Value()
+			o.FDecay = ws.fD.Value()
+			o.FSustain = ws.fS.Value()
+			o.FRelease = ws.fR.Value()
+
+			o.LFOShape = ws.lfoShape.Items()[ws.lfoShape.SelectedIndex()]
+			o.LFOTarget = ws.lfoTarget.Items()[ws.lfoTarget.SelectedIndex()]
+			o.LFORate = ws.lfoRate.Value()
+			o.LFODepth = ws.lfoDepth.Value()
+			o.LFOPitch = ws.lfoPitch.Value()
+
+			o.Drive = ws.drive.Value()
+			o.DelayTime = ws.delTime.Value()
+			o.DelayFeed = ws.delFeed.Value()
+			o.DelayMix = ws.delMix.Value()
+			o.ReverbSize = ws.revSize.Value()
+			o.ReverbMix = ws.revMix.Value()
+
+			o.Gain = ws.gain.Value()
+			o.VelToAmp = ws.velAmp.Value()
+			o.VelToFilt = ws.velFilt.Value()
+		})
+		previewValid = false
+		prevPb.Paint()
+	}
+
+	// ── Tab control ──
+	tabs := wui.NewTabControl()
+	w.Add(tabs)
+	tabs.AddTab("Oscillator")
+	tabs.AddTab("Filter")
+	tabs.AddTab("Envelopes")
+	tabs.AddTab("LFO")
+	tabs.AddTab("FX")
+
+	var panels []*wui.Panel
+	for i := 0; i < 5; i++ {
+		p := wui.NewPanel()
+		p.SetVisible(i == 0)
+		w.Add(p)
+		panels = append(panels, p)
+	}
+
+	// ── Oscillator panel ──
+	{
+		p := panels[0]
+		waveItems := []string{"sine", "square", "saw", "triangle", "noise"}
+		wave2Items := []string{"off", "sine", "square", "saw", "triangle", "noise"}
+
+		ws.wave1 = addSynthCombo(p, 20, 20, 90, 150, "Waveform 1", waveItems,
+			indexOf(waveItems, initial.Waveform1), func(int) { sync() })
+		ws.wave2 = addSynthCombo(p, 20, 60, 90, 150, "Waveform 2", wave2Items,
+			indexOf(wave2Items, initial.Waveform2), func(int) { sync() })
+		ws.osc2Detune = addSynthFloat(p, 20, 100, 100, 120, "Osc2 detune (st)",
+			-24, 24, 2, initial.Osc2Detune, func(float64) { sync() })
+		ws.osc2Mix = addSynthFloat(p, 20, 140, 100, 120, "Osc2 mix",
+			0, 1, 3, initial.Osc2Mix, func(float64) { sync() })
+
+		ws.subLevel = addSynthFloat(p, 360, 20, 110, 120, "Sub level",
+			0, 1, 3, initial.SubLevel, func(float64) { sync() })
+		ws.unisonVoices = addSynthInt(p, 360, 60, 110, 120, "Unison voices",
+			1, 7, initial.UnisonVoices, func(int) { sync() })
+		ws.unisonDetune = addSynthFloat(p, 360, 100, 110, 120, "Unison detune (c)",
+			0, 50, 1, initial.UnisonDetune, func(float64) { sync() })
+	}
+
+	// ── Filter panel ──
+	{
+		p := panels[1]
+		ftypes := []string{"off", "lp", "hp", "bp", "notch"}
+
+		ws.filtType = addSynthCombo(p, 20, 20, 90, 130, "Filter type", ftypes,
+			indexOf(ftypes, initial.FilterType), func(int) { sync() })
+		ws.filtCutoff = addSynthFloat(p, 20, 60, 100, 120, "Cutoff (Hz)",
+			20, 18000, 1, initial.FilterCutoff, func(float64) { sync() })
+		ws.filtReso = addSynthFloat(p, 20, 100, 100, 120, "Resonance (Q)",
+			0.5, 20, 2, initial.FilterReso, func(float64) { sync() })
+		ws.filtEnvAmt = addSynthFloat(p, 20, 140, 100, 120, "Env amount (oct)",
+			-4, 4, 2, initial.FilterEnvAmt, func(float64) { sync() })
+		ws.filtKeyTrack = addSynthFloat(p, 360, 20, 130, 120, "Key tracking",
+			0, 1, 3, initial.FilterKeyTrack, func(float64) { sync() })
+	}
+
+	// ── Envelopes panel (stacked: Amp first, then Filter below) ──
+	{
+		p := panels[2]
+
+		addSynthHeader(p, 20, 10, 300, "Amplitude envelope")
+		ws.aA = addSynthFloat(p, 20, 38, 60, 90, "A (s)", 0.001, 4, 3, initial.Attack, func(float64) { sync() })
+		ws.aD = addSynthFloat(p, 190, 38, 60, 90, "D (s)", 0.001, 4, 3, initial.Decay, func(float64) { sync() })
+		ws.aS = addSynthFloat(p, 20, 74, 60, 90, "S", 0, 1, 3, initial.Sustain, func(float64) { sync() })
+		ws.aR = addSynthFloat(p, 190, 74, 60, 90, "R (s)", 0.001, 4, 3, initial.Release, func(float64) { sync() })
+
+		addSynthHeader(p, 20, 120, 300, "Filter envelope")
+		ws.fA = addSynthFloat(p, 20, 148, 60, 90, "A (s)", 0.001, 4, 3, initial.FAttack, func(float64) { sync() })
+		ws.fD = addSynthFloat(p, 190, 148, 60, 90, "D (s)", 0.001, 4, 3, initial.FDecay, func(float64) { sync() })
+		ws.fS = addSynthFloat(p, 20, 184, 60, 90, "S", 0, 1, 3, initial.FSustain, func(float64) { sync() })
+		ws.fR = addSynthFloat(p, 190, 184, 60, 90, "R (s)", 0.001, 4, 3, initial.FRelease, func(float64) { sync() })
+	}
+
+	// ── LFO panel ──
+	{
+		p := panels[3]
+		lfoShapes := []string{"off", "sine", "tri", "square", "saw"}
+		targets := []string{"off", "amp", "filter"}
+
+		ws.lfoShape = addSynthCombo(p, 20, 20, 90, 130, "Shape", lfoShapes,
+			indexOf(lfoShapes, initial.LFOShape), func(int) { sync() })
+		ws.lfoRate = addSynthFloat(p, 20, 60, 100, 120, "Rate (Hz)",
+			0.05, 20, 2, initial.LFORate, func(float64) { sync() })
+		ws.lfoDepth = addSynthFloat(p, 20, 100, 100, 120, "Depth",
+			0, 1, 3, initial.LFODepth, func(float64) { sync() })
+		ws.lfoTarget = addSynthCombo(p, 360, 20, 100, 130, "Target", targets,
+			indexOf(targets, initial.LFOTarget), func(int) { sync() })
+		ws.lfoPitch = addSynthFloat(p, 360, 60, 130, 90, "Pitch (st, reserved)",
+			0, 12, 2, initial.LFOPitch, func(float64) { sync() })
+	}
+
+	// ── FX panel (compressed for the standard modal width) ──
+	{
+		p := panels[4]
+
+		addSynthHeader(p, 20, 10, 200, "Drive")
+		ws.drive = addSynthFloat(p, 20, 40, 100, 110, "Drive",
+			0, 1, 3, initial.Drive, func(float64) { sync() })
+
+		addSynthHeader(p, 20, 80, 300, "Delay")
+		ws.delTime = addSynthFloat(p, 20, 110, 100, 90, "Time (s)",
+			0.01, 1.0, 3, initial.DelayTime, func(float64) { sync() })
+		ws.delFeed = addSynthFloat(p, 230, 110, 100, 90, "Feedback",
+			0, 0.9, 2, initial.DelayFeed, func(float64) { sync() })
+		ws.delMix = addSynthFloat(p, 440, 110, 100, 90, "Mix",
+			0, 1, 3, initial.DelayMix, func(float64) { sync() })
+
+		addSynthHeader(p, 20, 155, 300, "Reverb")
+		ws.revSize = addSynthFloat(p, 20, 185, 100, 90, "Size",
+			0, 1, 3, initial.ReverbSize, func(float64) { sync() })
+		ws.revMix = addSynthFloat(p, 230, 185, 100, 90, "Mix",
+			0, 1, 3, initial.ReverbMix, func(float64) { sync() })
+	}
+
+	// ── Master row ──
+	masterLbl := newLabel("Master", 0, 0, 60, labelH)
+	if fontBold != nil {
+		masterLbl.SetFont(fontBold)
+	}
+	w.Add(masterLbl)
+
+	gainLbl := newLabel("Gain", 0, 0, 40, labelH)
+	w.Add(gainLbl)
+	ws.gain = wui.NewFloatUpDown()
+	ws.gain.SetMinMax(0, 1)
+	ws.gain.SetPrecision(3)
+	ws.gain.SetValue(initial.Gain)
+	ws.gain.SetOnValueChange(func(float64) { sync() })
+	w.Add(ws.gain)
+
+	velAmpLbl := newLabel("Vel→Amp", 0, 0, 70, labelH)
+	w.Add(velAmpLbl)
+	ws.velAmp = wui.NewFloatUpDown()
+	ws.velAmp.SetMinMax(0, 1)
+	ws.velAmp.SetPrecision(3)
+	ws.velAmp.SetValue(initial.VelToAmp)
+	ws.velAmp.SetOnValueChange(func(float64) { sync() })
+	w.Add(ws.velAmp)
+
+	velFiltLbl := newLabel("Vel→Filter", 0, 0, 80, labelH)
+	w.Add(velFiltLbl)
+	ws.velFilt = wui.NewFloatUpDown()
+	ws.velFilt.SetMinMax(0, 1)
+	ws.velFilt.SetPrecision(3)
+	ws.velFilt.SetValue(initial.VelToFilt)
+	ws.velFilt.SetOnValueChange(func(float64) { sync() })
+	w.Add(ws.velFilt)
+
+	// ── Preview label ──
+	prevLbl := newLabel("Preview (C4 → G4)", 0, 0, 200, labelH)
+	if fontBold != nil {
+		prevLbl.SetFont(fontBold)
+	}
+	w.Add(prevLbl)
+
+	// ── Buttons ──
+	btnPreview := newBtn("Preview Note", 0, 0, 130, btnH, nil)
+	w.Add(btnPreview)
+	btnReset := newBtn("Reset", 0, 0, 90, btnH, nil)
+	w.Add(btnReset)
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	btnPreview.SetOnClick(func() {
+		ensureSpeakerInit()
+		cfg := globalSynth.Snapshot()
+		buf := previewBuf(cfg, 1.2)
+		stream := &positionStreamer{buf: buf}
+		speaker.Clear()
+		speaker.Play(stream)
+	})
+
+	btnReset.SetOnClick(func() {
+		def := defaultSynthOptions()
+		globalSynth.Update(func(o *SynthOptions) { *o = def })
+
+		ws.wave1.SetSelectedIndex(indexOf(ws.wave1.Items(), def.Waveform1))
+		ws.wave2.SetSelectedIndex(indexOf(ws.wave2.Items(), def.Waveform2))
+		ws.osc2Detune.SetValue(def.Osc2Detune)
+		ws.osc2Mix.SetValue(def.Osc2Mix)
+		ws.subLevel.SetValue(def.SubLevel)
+		ws.unisonVoices.SetValue(def.UnisonVoices)
+		ws.unisonDetune.SetValue(def.UnisonDetune)
+
+		ws.filtType.SetSelectedIndex(indexOf(ws.filtType.Items(), def.FilterType))
+		ws.filtCutoff.SetValue(def.FilterCutoff)
+		ws.filtReso.SetValue(def.FilterReso)
+		ws.filtEnvAmt.SetValue(def.FilterEnvAmt)
+		ws.filtKeyTrack.SetValue(def.FilterKeyTrack)
+
+		ws.aA.SetValue(def.Attack)
+		ws.aD.SetValue(def.Decay)
+		ws.aS.SetValue(def.Sustain)
+		ws.aR.SetValue(def.Release)
+		ws.fA.SetValue(def.FAttack)
+		ws.fD.SetValue(def.FDecay)
+		ws.fS.SetValue(def.FSustain)
+		ws.fR.SetValue(def.FRelease)
+
+		ws.lfoShape.SetSelectedIndex(indexOf(ws.lfoShape.Items(), def.LFOShape))
+		ws.lfoRate.SetValue(def.LFORate)
+		ws.lfoDepth.SetValue(def.LFODepth)
+		ws.lfoTarget.SetSelectedIndex(indexOf(ws.lfoTarget.Items(), def.LFOTarget))
+		ws.lfoPitch.SetValue(def.LFOPitch)
+
+		ws.drive.SetValue(def.Drive)
+		ws.delTime.SetValue(def.DelayTime)
+		ws.delFeed.SetValue(def.DelayFeed)
+		ws.delMix.SetValue(def.DelayMix)
+		ws.revSize.SetValue(def.ReverbSize)
+		ws.revMix.SetValue(def.ReverbMix)
+
+		ws.gain.SetValue(def.Gain)
+		ws.velAmp.SetValue(def.VelToAmp)
+		ws.velFilt.SetValue(def.VelToFilt)
+
+		previewValid = false
+		prevPb.Paint()
+	})
+
+	// ── Tab switching ──
+	tabs.SetOnChange(func(idx int) {
+		for i, p := range panels {
+			p.SetVisible(i == idx)
+		}
+	})
+
+	// ── Layout ──
+	applyLayout(w, func(iw, ih int) {
+		tabX := margin
+		tabY := margin
+		tabW := iw - 2*margin
+		tabH := 280
+		tabs.SetBounds(tabX, tabY, tabW, tabH)
+
+		cx, cy, cw, chh := tabs.ContentBounds()
+		for _, p := range panels {
+			p.SetBounds(cx+2, cy+2, cw-4, chh-4)
+		}
+
+		// ── Master row ──
+		masterY := tabY + tabH + 10
+		masterLbl.SetBounds(margin, masterY+4, 60, labelH)
+
+		gainLbl.SetBounds(margin+60, masterY+4, 40, labelH)
+		ws.gain.SetBounds(margin+100, masterY, 80, editH)
+
+		velAmpLbl.SetBounds(margin+200, masterY+4, 70, labelH)
+		ws.velAmp.SetBounds(margin+270, masterY, 80, editH)
+
+		velFiltLbl.SetBounds(margin+370, masterY+4, 80, labelH)
+		ws.velFilt.SetBounds(margin+450, masterY, 80, editH)
+
+		// ── Preview ──
+		prevY := masterY + editH + 10
+		prevLbl.SetBounds(margin, prevY+2, 200, labelH)
+		prevY += labelH + 4
+
+		barY := ih - margin - btnH
+		prevH := barY - prevY - rowGap
+		if prevH < 60 {
+			prevH = 60
+		}
+		prevPb.SetBounds(margin, prevY, iw-2*margin, prevH)
+
+		// ── Buttons ──
+		btnPreview.SetBounds(margin, barY, 130, btnH)
+		btnReset.SetBounds(margin+140, barY, 90, btnH)
+		btnClose.SetBounds(iw-margin-closeBtnW, barY, closeBtnW, btnH)
+	})
+
+	prevPb.Paint()
+	showModal(w)
+}
+
+// indexOf returns the index of s in list, or 0 if not found.
+func indexOf(list []string, s string) int {
+	for i, v := range list {
+		if v == s {
+			return i
+		}
+	}
+	return 0
 }
