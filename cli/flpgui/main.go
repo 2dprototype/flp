@@ -91,16 +91,19 @@ func (w *wavetableSet) table(name string) []float64 {
 // ───────────── synth options ─────────────
 
 // SynthOptions is the complete parameter set of the built-in synthesizer.
-// It is passed by value and is safe to copy.
 type SynthOptions struct {
 	// ── Oscillators ──
 	Waveform1    string
 	Waveform2    string
-	Osc2Detune   float64
-	Osc2Mix      float64
-	SubLevel     float64
-	UnisonVoices int
-	UnisonDetune float64
+	Osc1Pitch    int     // semitones, -24..24
+	Osc2Pitch    int     // semitones, -24..24
+	Osc2Detune   float64 // cents, -50..50 (fine detune for osc 2)
+	Osc2Mix      float64 // 0..1, crossfade between osc1 and osc2
+	SubLevel     float64 // 0..1, sub-oscillator level
+	PulseWidth   float64 // 0.05..0.95, duty cycle when a square wave is selected
+	Phase        float64 // 0..1, starting phase for all oscillators
+	UnisonVoices int     // 1..7
+	UnisonDetune float64 // cents, 0..50 spread between unison voices
 
 	// ── Filter ──
 	FilterType     string
@@ -140,23 +143,32 @@ type SynthOptions struct {
 	Gain      float64
 	VelToAmp  float64
 	VelToFilt float64
+	// RootKey is the reference pitch of the synth. Every note played is
+	// transposed by (RootKey - 60) semitones, so changing RootKey shifts the
+	// entire instrument up or down. Set interactively via right-click on the
+	// on-screen piano keyboard.
+	RootKey int // MIDI note 0..127; 60 = C4 (no transposition)
 
 	// ── Sample playback (one-shots) ──
-	SampleAttack  float64 // s, 0 = no fade-in (hard start)
-	SampleDecay   float64 // s, time to fall from 1.0 to SampleSustain
-	SampleSustain float64 // 0..1, level held during the middle of the sample
-	SampleRelease float64 // s, 0 = no fade-out (hard end at sample boundary)
-	SampleVolume  float64 // 0..1 (can exceed 1 for boost), global multiplier
-	SamplePitch   float64 // semitones, additional offset on top of note-key pitch
+	SampleAttack  float64
+	SampleDecay   float64
+	SampleSustain float64
+	SampleRelease float64
+	SampleVolume  float64
+	SamplePitch   float64
 }
 
 func defaultSynthOptions() SynthOptions {
 	return SynthOptions{
 		Waveform1:    "sine",
 		Waveform2:    "off",
+		Osc1Pitch:    0,
+		Osc2Pitch:    0,
 		Osc2Detune:   0,
 		Osc2Mix:      0,
 		SubLevel:     0,
+		PulseWidth:   0.5,
+		Phase:        0,
 		UnisonVoices: 1,
 		UnisonDetune: 0,
 
@@ -189,15 +201,15 @@ func defaultSynthOptions() SynthOptions {
 		ReverbSize: 0,
 		ReverbMix:  0,
 
-		Gain:      1.0, // Increased for a louder, closer-to-FL master mix
+		Gain:      1.0,
 		VelToAmp:  0.7,
 		VelToFilt: 0,
+		RootKey:   60,
 
-		// ── Sample defaults: 0 attack and 0 release for authentic one-shots ──
 		SampleAttack:  0.0,
 		SampleDecay:   0.0,
 		SampleSustain: 1.0,
-		SampleRelease: 0.0, // Fixed: set to 0 so drum tails aren't cut/blunted
+		SampleRelease: 0.0,
 		SampleVolume:  1.0,
 		SamplePitch:   0.0,
 	}
@@ -564,7 +576,12 @@ func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64,
 	if startSample >= len(buf) {
 		return
 	}
-	pitchRatio := math.Pow(2.0, (float64(n.Key-60)+opt.SamplePitch)/12.0)
+
+	// Root-key transposition: every note is shifted by (RootKey - 60) semitones.
+	// The natural sample pitch corresponds to MIDI 60; the extra RootKey shift
+	// is what "sets the key" of the synth.
+	semitones := float64(n.Key-60) + float64(opt.RootKey-60) + opt.SamplePitch
+	pitchRatio := math.Pow(2.0, semitones/12.0)
 	if pitchRatio <= 0 {
 		return
 	}
@@ -575,14 +592,9 @@ func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64,
 	gain := opt.SampleVolume * channelGain * vel
 	naturalOut := int(float64(len(sample)) / pitchRatio)
 
-	// Calculate exact note duration in samples based on piano roll length
 	noteSamples := int(float64(n.Length) * spt * sr)
 	releaseSamples := int(opt.SampleRelease * sr)
-	
-	// Total playback length is the held note duration + the release tail
 	maxSamples := noteSamples + releaseSamples
-
-	// Cap playback at the sample's natural length to prevent out-of-bounds reading
 	if maxSamples > naturalOut {
 		maxSamples = naturalOut
 	}
@@ -624,8 +636,6 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 	chanGains := make(map[int]float64, len(channels))
 	haveSamples := false
 	for iid, ch := range chByIid {
-		// Per-channel gain: FL stores volume in a 0..12800 range where
-		// 12800 is the setter's "1.0" (see mutations_transform.go).
 		g := 1.0
 		if ch.Levels != nil {
 			g = float64(ch.Levels.Volume) / 12800.0
@@ -651,7 +661,7 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 		}
 	}
 
-	// ── Buffer length: max of pattern-note ends and clip ends + tail ──
+	// ── Buffer length ──
 	var maxTick uint32
 	for _, n := range pat.Notes {
 		if e := n.Position + n.Length; e > maxTick {
@@ -686,16 +696,33 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 		return buf
 	}
 
-	// ── Waveform tables (nil = noise) ──
+	// ── Waveform tables (nil = noise; square = comparator so PulseWidth works) ──
 	var table1, table2 []float64
-	if opt.Waveform1 != "noise" {
+	wave1IsSquare := false
+	if opt.Waveform1 == "square" {
+		wave1IsSquare = true
+	} else if opt.Waveform1 != "noise" {
 		table1 = wavetables.table(opt.Waveform1)
 	}
 	osc2Active := opt.Waveform2 != "off" && opt.Waveform2 != "" && opt.Osc2Mix > 0.001
-	if osc2Active && opt.Waveform2 != "noise" {
-		table2 = wavetables.table(opt.Waveform2)
+	wave2IsSquare := false
+	if osc2Active {
+		if opt.Waveform2 == "square" {
+			wave2IsSquare = true
+		} else if opt.Waveform2 != "noise" {
+			table2 = wavetables.table(opt.Waveform2)
+		}
 	}
 	subTable := wavetables.sine
+
+	// Clamp PulseWidth once (used every sample).
+	pulseWidth := opt.PulseWidth
+	if pulseWidth < 0.05 {
+		pulseWidth = 0.05
+	}
+	if pulseWidth > 0.95 {
+		pulseWidth = 0.95
+	}
 
 	unisonVoices := opt.UnisonVoices
 	if unisonVoices < 1 {
@@ -713,6 +740,9 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 	lfoActive := (opt.LFOShape == "sine" || opt.LFOShape == "tri" ||
 		opt.LFOShape == "square" || opt.LFOShape == "saw") &&
 		(opt.LFOTarget == "amp" || opt.LFOTarget == "filter")
+
+	// Root-key transposition applied to every voice.
+	rootShift := opt.RootKey - 60
 
 	renderVoice := func(n flp.Note) {
 		if n.Length == 0 {
@@ -751,22 +781,35 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 		velAmp := (1 - opt.VelToAmp) + opt.VelToAmp*vel
 		velFilt := 1.0 + opt.VelToFilt*(vel-0.5)*2
 
-		baseHz := midiKeyToHz(n.Key)
-		subIncr := baseHz * 0.5 * float64(wavetableSize) / sr
-		osc2Incr := baseHz * math.Pow(2, opt.Osc2Detune/12.0) * float64(wavetableSize) / sr
+		// Pitch: root-key shift + per-oscillator semitone offset.
+		baseKey1 := n.Key + rootShift + opt.Osc1Pitch
+		baseKey2 := n.Key + rootShift + opt.Osc2Pitch
+		baseHz1 := midiKeyToHz(baseKey1)
+		baseHz2 := midiKeyToHz(baseKey2)
+		subHz := midiKeyToHz(baseKey1 - 12) // one octave below osc 1
+
+		subIncr := subHz * float64(wavetableSize) / sr
+		osc2Incr := baseHz2 * math.Pow(2, opt.Osc2Detune/12.0) * float64(wavetableSize) / sr
+
+		// Starting phase for every voice.
+		phaseOffset := opt.Phase * float64(wavetableSize)
 
 		unisonPhases := make([]float64, unisonVoices)
 		unisonIncrs := make([]float64, unisonVoices)
 		for u := 0; u < unisonVoices; u++ {
+			unisonPhases[u] = phaseOffset
 			var cents float64
 			if unisonVoices > 1 {
 				t := float64(u)/float64(unisonVoices-1)*2 - 1
 				cents = t * opt.UnisonDetune
 			}
-			unisonIncrs[u] = baseHz * math.Pow(2, cents/1200.0) * float64(wavetableSize) / sr
+			unisonIncrs[u] = baseHz1 * math.Pow(2, cents/1200.0) * float64(wavetableSize) / sr
 		}
 
 		var subPhase, osc2Phase float64
+		subPhase = phaseOffset
+		osc2Phase = phaseOffset
+
 		var filt biquad
 		filtCountdown := 0
 		lfoIncr := opt.LFORate / sr
@@ -790,8 +833,24 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 				break
 			}
 
+			// ── Oscillator 1 (unison, pulse-width-aware for square) ──
 			var osc float64
-			if table1 != nil {
+			if wave1IsSquare {
+				var sum float64
+				for u := 0; u < unisonVoices; u++ {
+					p := unisonPhases[u] / float64(wavetableSize)
+					if p < pulseWidth {
+						sum += 1
+					} else {
+						sum -= 1
+					}
+					unisonPhases[u] += unisonIncrs[u]
+					if unisonPhases[u] >= wavetableSize {
+						unisonPhases[u] -= wavetableSize
+					}
+				}
+				osc = sum * unisonAmp
+			} else if table1 != nil {
 				var sum float64
 				for u := 0; u < unisonVoices; u++ {
 					idx := int(unisonPhases[u]) & wavetableMask
@@ -807,9 +866,17 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 				osc = float64(int32(noiseState)) / float64(1<<31)
 			}
 
+			// ── Oscillator 2 (mix in) ──
 			if osc2Active {
 				var v2 float64
-				if table2 != nil {
+				if wave2IsSquare {
+					p := osc2Phase / float64(wavetableSize)
+					if p < pulseWidth {
+						v2 = 1
+					} else {
+						v2 = -1
+					}
+				} else if table2 != nil {
 					v2 = table2[int(osc2Phase)&wavetableMask]
 				} else {
 					noiseState = noiseState*1664525 + 1013904223
@@ -822,6 +889,7 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 				}
 			}
 
+			// ── Sub oscillator ──
 			if opt.SubLevel > 0.001 {
 				osc += subTable[int(subPhase)&wavetableMask] * opt.SubLevel
 				subPhase += subIncr
@@ -832,6 +900,7 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 
 			osc *= ampVal * velAmp
 
+			// ── LFO ──
 			var lfoVal float64
 			if lfoActive {
 				switch opt.LFOShape {
@@ -861,6 +930,7 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 				}
 			}
 
+			// ── Filter ──
 			if filterActive {
 				if filtCountdown <= 0 {
 					fc := opt.FilterCutoff
@@ -868,7 +938,8 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 						fc *= math.Pow(2, opt.FilterEnvAmt*filtVal)
 					}
 					if opt.FilterKeyTrack > 0.001 {
-						semitones := float64(n.Key - 60)
+						// Track the actual played pitch (root-shifted).
+						semitones := float64(n.Key + rootShift - 60)
 						fc *= math.Pow(2, semitones*opt.FilterKeyTrack/12.0)
 					}
 					if lfoActive && opt.LFOTarget == "filter" {
@@ -881,7 +952,7 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 				filtCountdown--
 				osc = filt.process(osc)
 			}
-			
+
 			buf[i] += osc
 		}
 	}
@@ -895,9 +966,7 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 		renderVoice(n)
 	}
 
-	// ── 2) Extra channel clips (playlist audio / sampler) ──
-	// Each clip plays its sample from cl.Position for at most cl.Length ticks.
-	// That's the "sample length as the FLP data says" behaviour.
+	// ── 2) Extra channel clips ──
 	for _, cl := range extraChannelClips {
 		smp, ok := chanSamples[cl.ItemIndex]
 		if !ok || len(smp) < 2 {
@@ -911,17 +980,17 @@ func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOpti
 		if clipSamples <= 0 {
 			continue
 		}
-		// Audio clips play at original pitch (Key=60), so the pitch ratio
-		// comes solely from the user's global SamplePitch.
-		pitchRatio := math.Pow(2.0, opt.SamplePitch/12.0)
+		// Clips play at natural pitch + RootKey transpose + global SamplePitch.
+		semitones := float64(opt.RootKey-60) + opt.SamplePitch
+		pitchRatio := math.Pow(2.0, semitones/12.0)
 		if pitchRatio <= 0 {
 			continue
 		}
-		gain := opt.SampleVolume * chanGains[cl.ItemIndex] // clips are unity velocity
+		gain := opt.SampleVolume * chanGains[cl.ItemIndex]
 		mixSampleEx(buf, smp, startSample, clipSamples, pitchRatio, gain, opt, sr)
 	}
 
-	// ── 3) Master chain: drive → delay → reverb → gain ──
+	// ── 3) Master chain ──
 	if opt.Drive > 0.001 {
 		d := 1.0 + opt.Drive*15
 		for i, v := range buf {
@@ -1079,13 +1148,19 @@ patLen := uint32(0)
 	return renderPatternWithClips(synth, ppq, bpm, opt, channels, flpPath, channelClips)
 }
 
-// previewBuf renders a short two-note demo (C4, then G4) with the given
-// settings, truncated to durationSec.
+// previewBuf renders a single C4 note (kept for callers that just want a
+// generic preview).
 func previewBuf(cfg SynthOptions, durationSec float64) []float64 {
+	return previewNoteBuf(cfg, 60, durationSec)
+}
+
+// previewNoteBuf renders a single note at the given MIDI key. Used by the
+// synthesizer settings modal for the top waveform preview and for every
+// key click on the on-screen piano keyboard.
+func previewNoteBuf(cfg SynthOptions, midiKey int, durationSec float64) []float64 {
 	pat := flp.Pattern{
 		Notes: []flp.Note{
-			{Position: 0, Length: 48, Key: 60, Velocity: 100, ChannelIid: 0},
-			{Position: 48, Length: 96, Key: 67, Velocity: 110, ChannelIid: 0},
+			{Position: 0, Length: 96, Key: midiKey, Velocity: 100, ChannelIid: 0},
 		},
 	}
 	buf := renderPattern(pat, 96, 120, cfg, nil, "")
@@ -1094,6 +1169,24 @@ func previewBuf(cfg SynthOptions, durationSec float64) []float64 {
 		buf = buf[:n]
 	}
 	return buf
+}
+
+// kbdIsBlackKey reports whether a MIDI note is a black key.
+func kbdIsBlackKey(k int) bool {
+	switch ((k % 12) + 12) % 12 {
+	case 1, 3, 6, 8, 10:
+		return true
+	}
+	return false
+}
+
+// noteNameFromMIDI renders a MIDI number in scientific pitch notation with
+// middle C (MIDI 60) labelled as C4.
+func noteNameFromMIDI(key int) string {
+	names := []string{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}
+	octave := key/12 - 1
+	idx := ((key % 12) + 12) % 12
+	return fmt.Sprintf("%s%d", names[idx], octave)
 }
 
 func maxInt(a, b int) int {
@@ -3200,6 +3293,23 @@ type vizState struct {
 	dragStartScrollX int
 	dragStartScrollY int
 
+	sbResizeBaseZoom float64
+
+	// ── Piano roll editing ──
+	editMode     bool // "Edit"/"Done" toggle
+	snapEnabled  bool // snap-to-grid toggle
+	noteHoverIdx int  // -1 = none
+	noteHoverEdge bool
+
+	dragNoteIdx     int
+	dragNoteMode    int // 1 = move, 2 = resize
+	dragNoteOrig    flp.Note
+	dragNoteStartLX int
+	dragNoteStartLY int
+	dragNoteCurLX   int
+	dragNoteCurLY   int
+	dragNoteMoved   bool
+
 	patternIdx     int
 	arrangementIdx int
 
@@ -3227,7 +3337,6 @@ func (s *vizState) currentTick() uint32 {
 	return s.manualTick
 }
 
-
 func openVisualizerTool(_ *wui.Window) {
 	if app.Project == nil {
 		wui.MessageBoxInfo("Visualizer", "Please load a project first.")
@@ -3241,7 +3350,7 @@ func openVisualizerTool(_ *wui.Window) {
 	type renderState struct {
 		active bool
 		start  time.Time
-		gen    int // bumped on every new request / cancellation
+		gen    int
 	}
 	rs := &renderState{}
 
@@ -3253,7 +3362,10 @@ func openVisualizerTool(_ *wui.Window) {
 		opts      SynthOptions
 		gen       int
 	}
-	renderDoneCh := make(chan renderResult, 1)
+	// Bigger buffer so multiple in-flight renders (which can happen when the
+	// user cancels and restarts quickly) can each push their result without
+	// racing for a single slot.
+	renderDoneCh := make(chan renderResult, 8)
 
 	// ── Widgets ──
 	lblView := newLabel("View:", 0, 0, 40, labelH)
@@ -3280,6 +3392,14 @@ func openVisualizerTool(_ *wui.Window) {
 	btnFit := newBtn("Fit", 0, 0, 40, editH, nil)
 	w.Add(btnFit)
 
+	// ── Edit / Done toggle ──
+	btnEdit := newBtn("Edit", 0, 0, 60, editH, nil)
+	w.Add(btnEdit)
+
+	// ── Snap toggle ──
+	btnSnap := newBtn("Snap", 0, 0, 60, editH, nil)
+	w.Add(btnSnap)
+
 	btnExportMIDI := newBtn("Export MIDI", 0, 0, 100, editH, nil)
 	w.Add(btnExportMIDI)
 
@@ -3299,9 +3419,7 @@ func openVisualizerTool(_ *wui.Window) {
 		if !rs.active {
 			return
 		}
-		// Marquee animation (indeterminate).
-		period := 1.0
-		phase := math.Mod(time.Since(rs.start).Seconds(), period) / period
+		phase := math.Mod(time.Since(rs.start).Seconds(), 1.0)
 		chunkW := cw / 2
 		if chunkW < 16 {
 			chunkW = 16
@@ -3335,12 +3453,48 @@ func openVisualizerTool(_ *wui.Window) {
 		arrangementIdx: 0,
 		player:         NewMIDIPlayer(),
 		synth:          globalSynth,
+		noteHoverIdx:   -1,
+		dragNoteIdx:    -1,
+		snapEnabled:    true, // start with snap on — feels musical
 	}
 
 	// ── Helpers ──
 	updatePlayBtn := func() {
-		canPlay := (s.view == "arrangement" || s.view == "pianoroll") && !rs.active
+		canPlay := (s.view == "arrangement" || s.view == "pianoroll") &&
+			!rs.active && !s.editMode
 		btnPlay.SetEnabled(canPlay)
+	}
+
+	updateEditBtns := func() {
+		isPR := s.view == "pianoroll"
+		btnEdit.SetEnabled(isPR)
+		btnSnap.SetEnabled(isPR)
+	}
+
+	// drainAll empties the render channel without blocking.
+	drainAll := func() {
+		for {
+			select {
+			case <-renderDoneCh:
+			default:
+				return
+			}
+		}
+	}
+
+	// cancelRender invalidates any in-flight render, clears the progress
+	// indicator, re-enables Play, and discards any pending results. It is
+	// the single point where rs.gen is bumped from outside the Play handler.
+	cancelRender := func() {
+		if !rs.active {
+			return
+		}
+		rs.gen++
+		rs.active = false
+		progressPb.SetVisible(false)
+		btnPlay.SetText("Play")
+		drainAll()
+		updatePlayBtn()
 	}
 
 	refreshSelection := func() {
@@ -3411,13 +3565,12 @@ func openVisualizerTool(_ *wui.Window) {
 		presetCmb.SetSelectedIndex(idx)
 	}
 
-	// ── Layout: 2 compact rows, then the paint box ──
 	applyLayout(w, func(iw, ih int) {
 		contentW := iw - 2*margin
 		rightEdge := iw - margin
 		y := margin
 
-		// ── Row 1: View | Pattern | Preset (fills the remaining width) ──
+		// ── Row 1: View | Pattern | Preset ──
 		x := margin
 		lblView.SetBounds(x, y+3, 40, labelH)
 		x += 40
@@ -3439,7 +3592,7 @@ func openVisualizerTool(_ *wui.Window) {
 
 		y += editH + 6
 
-		// ── Row 2: Zoom (left) — Play + Export (right) ──
+		// ── Row 2: Zoom - + Fit | Edit | Snap ..... Play + Export ──
 		x = margin
 		lblZoom.SetBounds(x, y+3, 44, labelH)
 		x += 44
@@ -3448,17 +3601,19 @@ func openVisualizerTool(_ *wui.Window) {
 		btnZoomIn.SetBounds(x, y, 28, editH)
 		x += 28 + 4
 		btnFit.SetBounds(x, y, 40, editH)
+		x += 40 + 10
+		btnEdit.SetBounds(x, y, 60, editH)
+		x += 60 + 6
+		btnSnap.SetBounds(x, y, 60, editH)
 
 		r := rightEdge
 		btnExportMIDI.SetBounds(r-100, y, 100, editH)
 		r -= 100 + 8
 		playX := r - 70
 		btnPlay.SetBounds(playX, y, 70, editH)
-
-		// Tiny progress bar directly under the Play button.
 		progressPb.SetBounds(playX, y+editH+2, 70, 4)
 
-		y += editH + 10 // extra 6px so the progress bar has room
+		y += editH + 10
 
 		// ── Paint box ──
 		bottomH := btnH + margin
@@ -3478,16 +3633,14 @@ func openVisualizerTool(_ *wui.Window) {
 
 	// ── Playback / rendering timer ──
 	s.playTimer = w.AddTimer(16, func() {
-		// Render in progress — animate bar, poll for completion.
 		if rs.active {
 			select {
 			case rr := <-renderDoneCh:
 				if rr.gen != rs.gen {
-					// Stale render (view changed, new play queued) — discard.
-					rs.active = false
-					progressPb.SetVisible(false)
-					updatePlayBtn()
-					btnPlay.SetText("Play")
+					// Stale render (a newer generation has been queued).
+					// Discard the buffer BUT keep rs.active = true — the
+					// current generation's render is still in flight and we
+					// must keep polling until its result arrives.
 					return
 				}
 				rs.active = false
@@ -3495,7 +3648,6 @@ func openVisualizerTool(_ *wui.Window) {
 				updatePlayBtn()
 				btnPlay.SetText("Stop")
 
-				// Cache the arrangement buffer for instant replays.
 				if s.view == "arrangement" {
 					s.arrCache = arrangementCache{
 						projectPtr: s.project,
@@ -3518,7 +3670,6 @@ func openVisualizerTool(_ *wui.Window) {
 			return
 		}
 
-		// Normal playback update.
 		if s.player == nil || !s.player.IsPlaying() {
 			btnPlay.SetText("Play")
 			s.playTimer.Stop()
@@ -3545,14 +3696,23 @@ func openVisualizerTool(_ *wui.Window) {
 	// ── View change ──
 	cmb.SetOnChange(func(_ int) {
 		stopPlayback()
+		cancelRender()
 		s.view = cmb.Items()[cmb.SelectedIndex()]
-		rs.gen++ // invalidate any pending render
 		s.scrollX, s.scrollY = 0, 0
+		s.noteHoverIdx = -1
+		s.noteHoverEdge = false
+		s.dragNoteIdx = -1
+		// Leaving pianoroll → force-exit edit mode.
+		if s.view != "pianoroll" && s.editMode {
+			s.editMode = false
+			btnEdit.SetText("Edit")
+		}
 		refreshSelection()
 		if s.view == "pianoroll" {
 			centerPianoRoll(s)
 		}
 		refreshPresetCombo()
+		updateEditBtns()
 		updatePlayBtn()
 		pb.Paint()
 	})
@@ -3563,6 +3723,7 @@ func openVisualizerTool(_ *wui.Window) {
 			return
 		}
 		stopPlayback()
+		cancelRender()
 		if s.view == "arrangement" {
 			s.arrangementIdx = i
 			s.manualTick = 0
@@ -3578,7 +3739,6 @@ func openVisualizerTool(_ *wui.Window) {
 		pb.Paint()
 	})
 
-	// ── Preset combo ──
 	presetCmb.SetOnChange(func(i int) {
 		if s.view != "pianoroll" {
 			return
@@ -3619,18 +3779,61 @@ func openVisualizerTool(_ *wui.Window) {
 		pb.Paint()
 	})
 
-	// ── Play button ──
+	// ── Edit toggle ──
+	btnEdit.SetOnClick(func() {
+		if !s.editMode {
+			// Entering edit mode.
+			stopPlayback()
+			// Kill any in-flight render and drain stale results.
+			cancelRender()
+			// Cancel any pending drag.
+			s.dragNoteIdx = -1
+			s.editMode = true
+			btnEdit.SetText("Done")
+		} else {
+			// Leaving edit mode.
+			s.editMode = false
+			s.noteHoverIdx = -1
+			s.noteHoverEdge = false
+			s.dragNoteIdx = -1
+			btnEdit.SetText("Edit")
+		}
+		updatePlayBtn()
+		pb.Paint()
+	})
+
+	// ── Snap toggle ──
+	btnSnap.SetOnClick(func() {
+		s.snapEnabled = !s.snapEnabled
+		if s.snapEnabled {
+			btnSnap.SetText("Snap")
+		} else {
+			btnSnap.SetText("Free")
+		}
+		pb.Paint()
+	})
+
+	// ── Play ──
 	btnPlay.SetOnClick(func() {
 		if rs.active {
-			return // already rendering
+			return
+		}
+		if s.editMode {
+			// Editing disables playback.
+			return
 		}
 		if s.player.IsPlaying() {
 			stopPlayback()
 			return
 		}
 		if s.view != "arrangement" && s.view != "pianoroll" {
-			return // play disabled in other views
+			return
 		}
+
+		// Drain any stale render results so the channel below is always
+		// empty before we spawn a new render (otherwise its non-blocking
+		// push could be dropped).
+		drainAll()
 
 		bpm := 120.0
 		if t := flp.GetTempo(s.project); t != nil {
@@ -3644,12 +3847,10 @@ func openVisualizerTool(_ *wui.Window) {
 		startTick := s.manualTick
 		opts := s.synth.Snapshot()
 
-		// ── Arrangement ──
 		if s.view == "arrangement" {
 			if s.arrangementIdx < 0 || s.arrangementIdx >= len(s.project.Arrangements) {
 				return
 			}
-			// Cache hit → play immediately, no rendering needed.
 			if s.arrCache.matches(s.project, s.arrangementIdx, opts) {
 				buf := s.arrCache.buf
 				if len(buf) == 0 {
@@ -3684,13 +3885,13 @@ func openVisualizerTool(_ *wui.Window) {
 					buf: buf, ppq: ppq, bpm: bpm, startTick: startTick, opts: opts, gen: myGen,
 				}:
 				default:
-					// A newer render has superseded this one.
+					// Buffer full; nothing we can do — the timer will drain
+					// slots on its next tick and the next render will succeed.
 				}
 			}()
 			return
 		}
 
-		// ── Piano roll ──
 		if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
 			return
 		}
@@ -3723,76 +3924,63 @@ func openVisualizerTool(_ *wui.Window) {
 		}()
 	})
 
-	w.SetOnMouseWheel(func(x, y int, delta float64) {
-		ticks := int(delta / 120)
-		if ticks == 0 && delta != 0 {
-			if delta > 0 {
-				ticks = 1
-			} else {
-				ticks = -1
-			}
-		}
-		s.scrollY -= ticks * 60
-		clampScroll(s)
-		pb.Paint()
-	})
-
-	w.SetOnKeyDown(func(key int) {
-		step := 40
-		switch key {
-		case wui.KeyUp:
-			s.scrollY -= step
-		case wui.KeyDown:
-			s.scrollY += step
-		case wui.KeyLeft:
-			s.scrollX -= step
-		case wui.KeyRight:
-			s.scrollX += step
-		case wui.KeyPrior:
-			s.scrollY -= s.vpH
-		case wui.KeyNext:
-			s.scrollY += s.vpH
-		case wui.KeyHome:
-			s.scrollY = 0
-			s.scrollX = 0
-		case wui.KeyEnd:
-			s.scrollY = 1 << 30
-		case wui.KeyAdd, wui.KeyOEMPlus:
-			if s.zoomX < 8 {
-				s.zoomX *= 1.25
-			}
-			clampScroll(s)
-		case wui.KeySubtract, wui.KeyOEMMinus:
-			if s.zoomX > 0.15 {
-				s.zoomX /= 1.25
-			}
-			clampScroll(s)
-		case wui.KeySpace:
-			btnPlay.OnClick()()
-		default:
-			return
-		}
-		clampScroll(s)
-		pb.Paint()
-	})
-
-	w.SetOnMouseDown(func(_ wui.MouseButton, x, y int) {
+	// ── Mouse handlers ──
+	w.SetOnMouseDown(func(btn wui.MouseButton, x, y int) {
 		px, py := pb.Position()
 		lx, ly := x-px, y-py
+
+		// 1) Piano roll editing — ONLY in edit mode.
+		if s.view == "pianoroll" && s.editMode && !rs.active {
+			if handlePianoRollMouseDown(s, btn, lx, ly) {
+				pb.Paint()
+				return
+			}
+		}
+
+		// 2) Scrollbar click / resize.
 		if handleScrollClick(s, lx, ly) {
 			pb.Paint()
 			return
 		}
+
+		// 3) Timeline scrub.
 		if handleTimelineScrub(s, lx, ly) {
 			pb.Paint()
 		}
 	})
 
 	w.SetOnMouseUp(func(_ wui.MouseButton, x, y int) {
+		if s.dragNoteIdx >= 0 {
+			handlePianoRollMouseUp(s)
+			pb.Paint()
+		}
 		s.dragMode = 0
 	})
 
 	pb.SetOnMouseMove(func(x, y int) {
+		// Hover highlight — only in edit mode.
+		if s.view == "pianoroll" && s.editMode && s.dragNoteIdx < 0 && s.dragMode == 0 {
+			idx, edge := pianoRollNoteAt(s, x, y)
+			if idx != s.noteHoverIdx || edge != s.noteHoverEdge {
+				s.noteHoverIdx = idx
+				s.noteHoverEdge = edge
+				pb.Paint()
+			}
+		}
+
+		// Piano roll note drag.
+		if s.dragNoteIdx >= 0 {
+			s.dragNoteCurLX = x
+			s.dragNoteCurLY = y
+			dx := x - s.dragNoteStartLX
+			dy := y - s.dragNoteStartLY
+			if dx*dx+dy*dy > 9 {
+				s.dragNoteMoved = true
+			}
+			pb.Paint()
+			return
+		}
+
 		if s.dragMode == 0 {
 			return
 		}
@@ -3820,9 +4008,9 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	})
 
-	// Populate combos and button state for the initial view.
 	refreshSelection()
 	refreshPresetCombo()
+	updateEditBtns()
 	updatePlayBtn()
 
 	defer stopPlayback()
@@ -3977,11 +4165,26 @@ func hThumb(s *vizState) (pos, size int) {
 	return thumbX, thumbW
 }
 
+const scrollResizeGrip = 10 // pixels of the thumb's far end that act as a resize handle
+
 func handleScrollClick(s *vizState, lx, ly int) bool {
+	// ── Vertical scrollbar ──
 	vx := s.pbW - scrollbarSize
-	if lx >= vx && lx < s.pbW && ly >= vizHeaderH && ly < s.pbH-scrollbarSize {
+	trackTop := vizHeaderH
+	trackBot := s.pbH - scrollbarSize
+	if lx >= vx && lx < s.pbW && ly >= trackTop && ly < trackBot {
 		pos, size := vThumb(s)
-		relY := ly - vizHeaderH
+		relY := ly - trackTop
+		gripTop := pos + size - scrollResizeGrip
+		gripBot := pos + size
+		if size > scrollResizeGrip*2 && relY >= gripTop && relY < gripBot {
+			// Enter vertical resize mode.
+			s.dragMode = 4
+			s.dragStartY = ly
+			s.dragStartScrollY = s.scrollY
+			s.sbResizeBaseZoom = s.zoomY
+			return true
+		}
 		if relY >= pos && relY < pos+size {
 			s.dragMode = 1
 			s.dragStartY = ly
@@ -3996,9 +4199,21 @@ func handleScrollClick(s *vizState, lx, ly int) bool {
 		}
 		return true
 	}
+
+	// ── Horizontal scrollbar ──
 	hy := s.pbH - scrollbarSize
 	if ly >= hy && ly < s.pbH && lx >= 0 && lx < s.pbW-scrollbarSize {
 		pos, size := hThumb(s)
+		gripL := pos + size - scrollResizeGrip
+		gripR := pos + size
+		if size > scrollResizeGrip*2 && lx >= gripL && lx < gripR {
+			// Enter horizontal resize mode.
+			s.dragMode = 5
+			s.dragStartX = lx
+			s.dragStartScrollX = s.scrollX
+			s.sbResizeBaseZoom = s.zoomX
+			return true
+		}
 		if lx >= pos && lx < pos+size {
 			s.dragMode = 2
 			s.dragStartX = lx
@@ -4018,7 +4233,7 @@ func handleScrollClick(s *vizState, lx, ly int) bool {
 
 func handleScrollDrag(s *vizState, lx, ly int) bool {
 	switch s.dragMode {
-	case 1:
+	case 1: // vertical thumb drag
 		_, size := vThumb(s)
 		delta := ly - s.dragStartY
 		trackH := s.pbH - vizHeaderH - scrollbarSize
@@ -4029,7 +4244,8 @@ func handleScrollDrag(s *vizState, lx, ly int) bool {
 		}
 		clampScroll(s)
 		return true
-	case 2:
+
+	case 2: // horizontal thumb drag
 		_, size := hThumb(s)
 		delta := lx - s.dragStartX
 		trackW := s.pbW - scrollbarSize
@@ -4040,9 +4256,348 @@ func handleScrollDrag(s *vizState, lx, ly int) bool {
 		}
 		clampScroll(s)
 		return true
+
+	case 4: // vertical scrollbar resize → scale zoomY
+		delta := ly - s.dragStartY
+		factor := math.Exp(-float64(delta) * 0.005)
+		z := s.sbResizeBaseZoom * factor
+		if z < 0.15 {
+			z = 0.15
+		}
+		if z > 8 {
+			z = 8
+		}
+		s.zoomY = z
+		clampScroll(s)
+		return true
+
+	case 5: // horizontal scrollbar resize → scale zoomX
+		delta := lx - s.dragStartX
+		factor := math.Exp(-float64(delta) * 0.005)
+		z := s.sbResizeBaseZoom * factor
+		if z < 0.15 {
+			z = 0.15
+		}
+		if z > 8 {
+			z = 8
+		}
+		s.zoomX = z
+		clampScroll(s)
+		return true
 	}
 	return false
 }
+
+// ───────────── piano roll editing ─────────────
+
+// vizSnapTicks returns the snap resolution (ticks) — 1/4 beat = 16th note.
+func vizSnapTicks(s *vizState) int {
+	ppq := 96
+	if s.project != nil && s.project.Header.PPQ > 0 {
+		ppq = s.project.Header.PPQ
+	}
+	n := ppq / 4
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// snapTick rounds tick to the nearest multiple of snapTicks.
+func snapTick(tick, snapTicks int, enabled bool) int {
+	if !enabled || snapTicks <= 0 {
+		return tick
+	}
+	r := (tick + snapTicks/2) / snapTicks * snapTicks
+	if r < 0 {
+		r = 0
+	}
+	return r
+}
+
+// isRightMouseButton reports whether btn is the right mouse button.
+// Uses the string form to avoid depending on the exact constant name.
+func isRightMouseButton(btn wui.MouseButton) bool {
+	s := strings.ToLower(btn.String())
+	if s == "right" || s == "r" || s == "rmb" || s == "right mouse button" {
+		return true
+	}
+	return strings.Contains(s, "right")
+}
+
+// vizReplacePatternNotes updates s.project in place with a new set of notes
+// for the pattern at patternIdx, then mirrors the change into app.Project.
+//
+// flp.SetPatternNotes only rewrites the raw event stream; it does not rebuild
+// the decoded Patterns slice. We therefore patch the pattern notes manually so
+// the visualizer (and every other consumer of app.Project) sees the update.
+func vizReplacePatternNotes(s *vizState, patternIdx int, notes []flp.Note) bool {
+	if s.project == nil || patternIdx < 0 || patternIdx >= len(s.project.Patterns) {
+		return false
+	}
+	pat := s.project.Patterns[patternIdx]
+	inputs := make([]flp.NoteInput, len(notes))
+	for i, n := range notes {
+		inputs[i] = flp.NoteToInput(n)
+	}
+	updated, err := flp.SetPatternNotes(s.project, pat.ID, inputs)
+	if err != nil {
+		return false
+	}
+	for i := range updated.Patterns {
+		if updated.Patterns[i].ID == pat.ID {
+			updated.Patterns[i].Notes = append([]flp.Note{}, notes...)
+			break
+		}
+	}
+	s.project = updated
+	app.Project = updated
+	s.arrCache.valid = false
+	return true
+}
+
+// pianoRollNoteAt returns the index of the note under (lx, ly), or -1.
+// The second return value indicates the cursor is over the right-edge
+// resize handle of that note.
+//
+// Coordinates are paintbox-local. Notes are checked in reverse order so the
+// top-most (last drawn) note wins.
+func pianoRollNoteAt(s *vizState, lx, ly int) (int, bool) {
+	if s.project == nil || s.view != "pianoroll" {
+		return -1, false
+	}
+	if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+		return -1, false
+	}
+	if lx < pianoKeysW || ly < vizHeaderH+rulerH {
+		return -1, false
+	}
+	if lx >= s.pbW-scrollbarSize || ly >= s.pbH-scrollbarSize {
+		return -1, false
+	}
+	pat := s.project.Patterns[s.patternIdx]
+	pxPerTick := basePxPerTick * s.zoomX
+	keyH := int(baseKeyH * s.zoomY)
+	if keyH < 4 {
+		keyH = 4
+	}
+	gridTop := vizHeaderH + rulerH
+
+	for i := len(pat.Notes) - 1; i >= 0; i-- {
+		n := pat.Notes[i]
+		nx := pianoKeysW + int(float64(n.Position)*pxPerTick) - s.scrollX
+		ny := gridTop + (127-int(n.Key))*keyH - s.scrollY
+		nw := int(float64(n.Length) * pxPerTick)
+		if nw < 2 {
+			nw = 2
+		}
+		nh := keyH - 2
+		if lx >= nx && lx < nx+nw && ly >= ny && ly < ny+nh {
+			edgeW := 6
+			if nw/5 > edgeW {
+				edgeW = nw / 5
+			}
+			return i, lx >= nx+nw-edgeW
+		}
+	}
+	return -1, false
+}
+
+// pianoRollDeleteNote removes the note at idx.
+func pianoRollDeleteNote(s *vizState, idx int) bool {
+	if s.project == nil || s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+		return false
+	}
+	pat := s.project.Patterns[s.patternIdx]
+	if idx < 0 || idx >= len(pat.Notes) {
+		return false
+	}
+	next := make([]flp.Note, 0, len(pat.Notes)-1)
+	for i, n := range pat.Notes {
+		if i == idx {
+			continue
+		}
+		next = append(next, n)
+	}
+	return vizReplacePatternNotes(s, s.patternIdx, next)
+}
+
+// pianoRollCreateNote inserts a new default-length note at the tick/key
+// implied by (lx, ly).
+func pianoRollCreateNote(s *vizState, lx, ly int) bool {
+	if s.project == nil || s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+		return false
+	}
+	pat := s.project.Patterns[s.patternIdx]
+	pxPerTick := basePxPerTick * s.zoomX
+	keyH := int(baseKeyH * s.zoomY)
+	if keyH < 4 {
+		keyH = 4
+	}
+	tick := float64(lx-pianoKeysW+s.scrollX) / pxPerTick
+	key := 127 - (ly-vizHeaderH-rulerH+s.scrollY)/keyH
+	if tick < 0 {
+		tick = 0
+	}
+	if key < 0 {
+		key = 0
+	}
+	if key > 131 {
+		key = 131
+	}
+	ppq := 96
+	if s.project.Header.PPQ > 0 {
+		ppq = s.project.Header.PPQ
+	}
+	chIid := 0
+	if len(s.project.Channels) > 0 {
+		chIid = s.project.Channels[0].Iid
+	}
+	newNote := flp.Note{
+		Position:   uint32(tick),
+		Length:     uint32(ppq),
+		Key:        key,
+		ChannelIid: chIid,
+		Flags:      0x4000,
+		FinePitch:  120,
+		Release:    64,
+		Pan:        64,
+		Velocity:   100,
+		ModX:       128,
+		ModY:       128,
+	}
+	next := append([]flp.Note{}, pat.Notes...)
+	next = append(next, newNote)
+	return vizReplacePatternNotes(s, s.patternIdx, next)
+}
+
+// pianoRollUpdateNote mutates the note at idx via the supplied function
+// and commits the change.
+func pianoRollUpdateNote(s *vizState, idx int, mutator func(*flp.Note)) bool {
+	if s.project == nil || s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+		return false
+	}
+	pat := s.project.Patterns[s.patternIdx]
+	if idx < 0 || idx >= len(pat.Notes) {
+		return false
+	}
+	next := append([]flp.Note{}, pat.Notes...)
+	mutator(&next[idx])
+	return vizReplacePatternNotes(s, s.patternIdx, next)
+}
+
+// handlePianoRollMouseDown processes a mouse-down inside the piano roll grid.
+// Returns true if the event was consumed.
+//
+//   - Left click on empty grid: nothing.
+//   - Left click on a note: enters "pending" drag (moves or resizes once the
+//     cursor moves; a click without a move deletes the note).
+//   - Right click on a note: deletes it.
+//   - Right click on empty grid: creates a default-length note.
+func handlePianoRollMouseDown(s *vizState, btn wui.MouseButton, lx, ly int) bool {
+	// Only react inside the grid — the ruler above is for the timeline scrub.
+	if lx < pianoKeysW || ly < vizHeaderH+rulerH {
+		return false
+	}
+	if lx >= s.pbW-scrollbarSize || ly >= s.pbH-scrollbarSize {
+		return false
+	}
+
+	idx, edge := pianoRollNoteAt(s, lx, ly)
+
+	if isRightMouseButton(btn) {
+		if idx >= 0 {
+			pianoRollDeleteNote(s, idx)
+			s.noteHoverIdx = -1
+			s.noteHoverEdge = false
+		} else {
+			pianoRollCreateNote(s, lx, ly)
+		}
+		return true
+	}
+
+	// Left button.
+	if idx >= 0 {
+		pat := s.project.Patterns[s.patternIdx]
+		s.dragNoteIdx = idx
+		s.dragNoteOrig = pat.Notes[idx]
+		s.dragNoteStartLX = lx
+		s.dragNoteStartLY = ly
+		s.dragNoteCurLX = lx
+		s.dragNoteCurLY = ly
+		s.dragNoteMoved = false
+		if edge {
+			s.dragNoteMode = 2 // resize right edge
+		} else {
+			s.dragNoteMode = 1 // move
+		}
+		return true
+	}
+
+	return false
+}
+
+// handlePianoRollMouseUp finalises a pending piano roll interaction.
+// A click that never moved deletes the note; a click that moved commits a
+// move or a resize.
+func handlePianoRollMouseUp(s *vizState) {
+	if s.dragNoteIdx < 0 {
+		return
+	}
+	idx := s.dragNoteIdx
+	orig := s.dragNoteOrig
+
+	if !s.dragNoteMoved {
+		// Treated as a plain click → delete.
+		pianoRollDeleteNote(s, idx)
+		s.dragNoteIdx = -1
+		return
+	}
+
+	pxPerTick := basePxPerTick * s.zoomX
+	keyH := int(baseKeyH * s.zoomY)
+	if keyH < 4 {
+		keyH = 4
+	}
+	dx := s.dragNoteCurLX - s.dragNoteStartLX
+	dy := s.dragNoteCurLY - s.dragNoteStartLY
+
+	if s.dragNoteMode == 1 {
+		tickDelta := int(math.Round(float64(dx) / pxPerTick))
+		newPos := int(orig.Position) + tickDelta
+		if newPos < 0 {
+			newPos = 0
+		}
+		keyDelta := -int(math.Round(float64(dy) / float64(keyH)))
+		newKey := orig.Key + keyDelta
+		if newKey < 0 {
+			newKey = 0
+		}
+		if newKey > 131 {
+			newKey = 131
+		}
+		if newPos != int(orig.Position) || newKey != orig.Key {
+			pianoRollUpdateNote(s, idx, func(n *flp.Note) {
+				n.Position = uint32(newPos)
+				n.Key = newKey
+			})
+		}
+	} else if s.dragNoteMode == 2 {
+		lenDelta := int(math.Round(float64(dx) / pxPerTick))
+		newLen := int(orig.Length) + lenDelta
+		if newLen < 1 {
+			newLen = 1
+		}
+		if newLen != int(orig.Length) {
+			pianoRollUpdateNote(s, idx, func(n *flp.Note) {
+				n.Length = uint32(newLen)
+			})
+		}
+	}
+
+	s.dragNoteIdx = -1
+}
+
 
 func measureContent(s *vizState) (int, int) {
 	p := s.project
@@ -4173,6 +4728,14 @@ func drawScrollbars(c *wui.Canvas, w, h int, s *vizState) {
 	if s.contentH > s.vpH {
 		pos, size := vThumb(s)
 		c.FillRect(trackX+2, trackY+pos, scrollbarSize-4, size, colThumb)
+		// Resize grip: 3 short horizontal lines at the bottom of the thumb.
+		if size > 16 {
+			gripY := trackY + pos + size - 6
+			for i := 0; i < 3; i++ {
+				y := gripY + i*2
+				c.Line(trackX+3, y, trackX+scrollbarSize-3, y, wui.RGB(245, 245, 245))
+			}
+		}
 	}
 
 	hTrackY := h - scrollbarSize
@@ -4181,6 +4744,14 @@ func drawScrollbars(c *wui.Canvas, w, h int, s *vizState) {
 	if s.contentW > s.vpW {
 		pos, size := hThumb(s)
 		c.FillRect(pos+2, hTrackY+2, size-4, scrollbarSize-4, colThumb)
+		// Resize grip: 3 short vertical lines at the right of the thumb.
+		if size > 16 {
+			gripX := pos + size - 6
+			for i := 0; i < 3; i++ {
+				x := gripX + i*2
+				c.Line(x, hTrackY+3, x, hTrackY+scrollbarSize-3, wui.RGB(245, 245, 245))
+			}
+		}
 	}
 
 	c.FillRect(trackX, hTrackY, scrollbarSize, scrollbarSize, colHeader)
@@ -4392,11 +4963,8 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		if y+keyH < gridTop || y > gridBottom {
 			continue
 		}
-
 		black := isBlackKey(k)
-
-		var keyCol wui.Color
-		var rowBg wui.Color
+		var keyCol, rowBg wui.Color
 		if black {
 			keyCol = wui.RGB(60, 62, 70)
 			rowBg = wui.RGB(242, 244, 248)
@@ -4410,7 +4978,6 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		c.FillRect(0, y, pianoKeysW, keyH, keyCol)
 		c.Line(0, y+keyH-1, pianoKeysW, y+keyH-1, wui.RGB(180, 184, 190))
 		c.FillRect(pianoKeysW, y, s.vpW-pianoKeysW, keyH, rowBg)
-
 		if k%12 == 0 {
 			c.TextOut(6, y+1, fmt.Sprintf("C%d", k/12-1), colTextDim)
 		}
@@ -4430,12 +4997,20 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		}
 		c.Line(bx, gridTop, bx, gridBottom, col)
 	}
+	
+	// Edit-mode indicator: a coloured frame around the grid area.
+	if s.editMode {
+		frameCol := wui.RGB(70, 130, 220)
+		c.Line(pianoKeysW, gridTop, s.vpW-1, gridTop, frameCol)
+		c.Line(pianoKeysW, gridBottom-1, s.vpW-1, gridBottom-1, frameCol)
+		c.Line(pianoKeysW, gridTop, pianoKeysW, gridBottom, frameCol)
+		c.Line(s.vpW-1, gridTop, s.vpW-1, gridBottom, frameCol)
+	}
 
-	// Notes
-	for _, n := range pat.Notes {
+	drawNote := func(n flp.Note, highlighted bool, isPreview bool) {
 		y := gridTop + (127-int(n.Key))*keyH - s.scrollY
 		if y+keyH < gridTop || y > gridBottom {
-			continue
+			return
 		}
 		x := pianoKeysW + int(float64(n.Position)*pxPerTick) - s.scrollX
 		nw := int(float64(n.Length) * pxPerTick)
@@ -4443,7 +5018,7 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 			nw = 2
 		}
 		if x+nw < pianoKeysW || x > s.vpW {
-			continue
+			return
 		}
 		if x < pianoKeysW {
 			nw -= pianoKeysW - x
@@ -4454,26 +5029,97 @@ func drawPianoRoll(c *wui.Canvas, s *vizState) {
 		}
 
 		col := noteColor(p, n.ChannelIid)
+		if isPreview {
+			col = wui.RGB(120, 200, 140)
+		}
 		c.FillRect(x, y+1, nw, keyH-2, col)
-		c.DrawRect(x, y+1, nw, keyH-2, colClipEdge)
+		outline := colClipEdge
+		if highlighted {
+			outline = wui.RGB(255, 255, 255)
+		}
+		if isPreview {
+			outline = wui.RGB(200, 255, 200)
+		}
+		c.DrawRect(x, y+1, nw, keyH-2, outline)
+
+		// Resize handle: a bright vertical bar at the right edge.
+		if highlighted && s.noteHoverEdge {
+			c.FillRect(x+nw-2, y+1, 2, keyH-2, wui.RGB(255, 255, 255))
+		}
 	}
 
-	// ── playback cursor ────────────────────────────────────────────
-	// Always drawn: shows the scrub position when idle, live position when
-	// playing. The user can click/drag anywhere in the grid to reposition.
-	var pos uint32
-	if s.player != nil && s.player.IsPlaying() {
-		pos = s.player.TickPosition()
-	} else {
-		pos = s.manualTick
+	// Draw notes, skipping the one currently being dragged.
+	for i, n := range pat.Notes {
+		if s.dragNoteIdx == i && s.dragNoteMoved {
+			continue
+		}
+		drawNote(n, i == s.noteHoverIdx, false)
 	}
-	cx := pianoKeysW + int(float64(pos)*pxPerTick) - s.scrollX
-	if cx >= pianoKeysW && cx <= s.vpW {
-		cursorCol := wui.RGB(220, 60, 60)
-		c.Line(cx, gridTop, cx, gridBottom, cursorCol)
-		// Triangular cap in the ruler so it's easy to spot and grab.
-		c.FillRect(cx-4, contentY+rulerH-9, 9, 9, cursorCol)
-		c.Line(cx-4, contentY+rulerH, cx+5, contentY+rulerH, colSep)
+
+	// Draw the preview of the note being dragged.
+	if s.dragNoteIdx >= 0 && s.dragNoteMoved {
+		preview := s.dragNoteOrig
+		if s.dragNoteMode == 1 {
+			dx := s.dragNoteCurLX - s.dragNoteStartLX
+			dy := s.dragNoteCurLY - s.dragNoteStartLY
+			tickDelta := int(math.Round(float64(dx) / pxPerTick))
+			newPos := int(preview.Position) + tickDelta
+			if newPos < 0 {
+				newPos = 0
+			}
+			if s.snapEnabled {
+				newPos = snapTick(newPos, vizSnapTicks(s), true)
+			}
+			preview.Position = uint32(newPos)
+			keyDelta := -int(math.Round(float64(dy) / float64(keyH)))
+			preview.Key += keyDelta
+			if preview.Key < 0 {
+				preview.Key = 0
+			}
+			if preview.Key > 131 {
+				preview.Key = 131
+			}
+		} else if s.dragNoteMode == 2 {
+			dx := s.dragNoteCurLX - s.dragNoteStartLX
+			lenDelta := int(math.Round(float64(dx) / pxPerTick))
+			newLen := int(preview.Length) + lenDelta
+			if newLen < 1 {
+				newLen = 1
+			}
+			if s.snapEnabled {
+				st := vizSnapTicks(s)
+				if newLen < st {
+					newLen = st
+				} else {
+					newLen = snapTick(newLen, st, true)
+				}
+				if newLen < 1 {
+					newLen = 1
+				}
+			}
+			preview.Length = uint32(newLen)
+		}
+		drawNote(preview, false, true)
+	}
+	
+	// ── playback cursor ──
+	// Hidden entirely while editing: playback is disabled in edit mode, so
+	// the cursor is stuck at manualTick and only gets in the way of the
+	// notes you're trying to click.
+	if !s.editMode {
+		var pos uint32
+		if s.player != nil && s.player.IsPlaying() {
+			pos = s.player.TickPosition()
+		} else {
+			pos = s.manualTick
+		}
+		cx := pianoKeysW + int(float64(pos)*pxPerTick) - s.scrollX
+		if cx >= pianoKeysW && cx <= s.vpW {
+			cursorCol := wui.RGB(220, 60, 60)
+			c.Line(cx, gridTop, cx, gridBottom, cursorCol)
+			c.FillRect(cx-4, contentY+rulerH-9, 9, 9, cursorCol)
+			c.Line(cx-4, contentY+rulerH, cx+5, contentY+rulerH, colSep)
+		}
 	}
 }
 
@@ -5665,24 +6311,60 @@ func openSynthSettingsTool(_ *wui.Window) {
 	w.SetOnClose(persistSynth)
 
 	initial := globalSynth.Snapshot()
+	
+	// ── Widget set ──
+	type widgetSet struct {
+		wave1, wave2                  *wui.ComboBox
+		osc1Pitch, osc2Pitch          *wui.IntUpDown
+		osc2Detune, osc2Mix, subLevel *wui.FloatUpDown
+		pulseWidth, phase             *wui.FloatUpDown
+		unisonVoices                  *wui.IntUpDown
+		unisonDetune                  *wui.FloatUpDown
 
-	// ── Preview cache (invalidated on any change) ──
+		filtType                         *wui.ComboBox
+		filtCutoff, filtReso             *wui.FloatUpDown
+		filtEnvAmt, filtKeyTrack         *wui.FloatUpDown
+
+		aA, aD, aS, aR *wui.FloatUpDown
+		fA, fD, fS, fR *wui.FloatUpDown
+
+		lfoShape, lfoTarget         *wui.ComboBox
+		lfoRate, lfoDepth, lfoPitch *wui.FloatUpDown
+
+		drive                    *wui.FloatUpDown
+		delTime, delFeed, delMix *wui.FloatUpDown
+		revSize, revMix          *wui.FloatUpDown
+
+		gain, velAmp, velFilt *wui.FloatUpDown
+		rootKey               *wui.IntUpDown
+
+		sampleAttack, sampleDecay, sampleSustain *wui.FloatUpDown
+		sampleRelease, sampleVolume, samplePitch *wui.FloatUpDown
+	}
+	var ws widgetSet
+
+	// ── Currently previewed MIDI note (middle C by default) ──
+	previewNote := 60
+
+	// ── Preview cache: keyed on (cfg, previewNote) ──
 	var (
 		previewBufCache []float64
 		previewCfg      SynthOptions
+		previewCacheKey int = -1
 		previewValid    bool
 	)
 	getPreview := func() []float64 {
 		cfg := globalSynth.Snapshot()
-		if !previewValid || cfg != previewCfg {
-			previewBufCache = previewBuf(cfg, 1.0)
+		if !previewValid || cfg != previewCfg || previewNote != previewCacheKey {
+			previewBufCache = previewNoteBuf(cfg, previewNote, 1.0)
 			previewCfg = cfg
+			previewCacheKey = previewNote
 			previewValid = true
 		}
 		return previewBufCache
 	}
 
-	// ── Preview paint box ──
+	// ── Preview paint box (waveform of the currently selected note) ──
 	prevPb := wui.NewPaintBox()
 	w.Add(prevPb)
 	prevPb.SetOnPaint(func(c *wui.Canvas) {
@@ -5737,41 +6419,191 @@ func openSynthSettingsTool(_ *wui.Window) {
 		c.Line(0, ch-1, cw, ch-1, wui.RGB(50, 58, 68))
 	})
 
-	// ── Widget set ──
-	type widgetSet struct {
-		wave1, wave2                  *wui.ComboBox
-		osc2Detune, osc2Mix, subLevel *wui.FloatUpDown
-		unisonVoices                  *wui.IntUpDown
-		unisonDetune                  *wui.FloatUpDown
-
-		filtType                         *wui.ComboBox
-		filtCutoff, filtReso             *wui.FloatUpDown
-		filtEnvAmt, filtKeyTrack         *wui.FloatUpDown
-
-		aA, aD, aS, aR *wui.FloatUpDown
-		fA, fD, fS, fR *wui.FloatUpDown
-
-		lfoShape, lfoTarget         *wui.ComboBox
-		lfoRate, lfoDepth, lfoPitch *wui.FloatUpDown
-
-		drive                    *wui.FloatUpDown
-		delTime, delFeed, delMix *wui.FloatUpDown
-		revSize, revMix          *wui.FloatUpDown
-
-		gain, velAmp, velFilt *wui.FloatUpDown
-
-		sampleAttack, sampleDecay, sampleSustain *wui.FloatUpDown
-		sampleRelease, sampleVolume, samplePitch *wui.FloatUpDown
+	// ── Preview label (shows preview note + root key) ──
+	prevLbl := newLabel("", 0, 0, 400, labelH)
+	if fontBold != nil {
+		prevLbl.SetFont(fontBold)
 	}
-	var ws widgetSet
+	w.Add(prevLbl)
+
+	refreshLabel := func() {
+		root := globalSynth.Snapshot().RootKey
+		prevLbl.SetText(fmt.Sprintf("Preview: %s  →  sounds %s    |    Root Key: %s",
+			noteNameFromMIDI(previewNote),
+			noteNameFromMIDI(previewNote+(root-60)),
+			noteNameFromMIDI(root)))
+	}
+	refreshLabel()
+
+	// ── Piano keyboard paint box ──
+	const kbdLowKey = 36  // C2
+	const kbdHighKey = 84 // C6
+
+	kbdWhiteCount := 0
+	for k := kbdLowKey; k <= kbdHighKey; k++ {
+		if !kbdIsBlackKey(k) {
+			kbdWhiteCount++
+		}
+	}
+
+	kbdPb := wui.NewPaintBox()
+	w.Add(kbdPb)
+
+	playNote := func(midiKey int) {
+		ensureSpeakerInit()
+		cfg := globalSynth.Snapshot()
+		buf := previewNoteBuf(cfg, midiKey, 1.5)
+		swapSpeakerStream(&positionStreamer{buf: buf})
+	}
+
+	updatePreviewFor := func(midiKey int) {
+		if midiKey < kbdLowKey || midiKey > kbdHighKey {
+			return
+		}
+		previewNote = midiKey
+		previewValid = false
+		refreshLabel()
+		prevPb.Paint()
+		kbdPb.Paint()
+	}
+
+	// hitTestKeyboard returns the MIDI key under (x, y), or -1 if none.
+	hitTestKeyboard := func(x, y int) int {
+		cw, ch := kbdPb.Size()
+		if cw < 4 || ch < 4 || kbdWhiteCount == 0 {
+			return -1
+		}
+		whiteW := float64(cw) / float64(kbdWhiteCount)
+		blackW := whiteW * 0.62
+		blackH := float64(ch) * 0.62
+
+		// Black keys first (they sit on top).
+		whiteBefore := 0
+		for k := kbdLowKey; k <= kbdHighKey; k++ {
+			if !kbdIsBlackKey(k) {
+				whiteBefore++
+				continue
+			}
+			cx := float64(whiteBefore) * whiteW
+			x0 := cx - blackW/2
+			x1 := x0 + blackW
+			if float64(y) < blackH && float64(x) >= x0 && float64(x) < x1 {
+				return k
+			}
+		}
+
+		// White keys.
+		wi := int(float64(x) / whiteW)
+		if wi < 0 || wi >= kbdWhiteCount {
+			return -1
+		}
+		cnt := 0
+		for k := kbdLowKey; k <= kbdHighKey; k++ {
+			if kbdIsBlackKey(k) {
+				continue
+			}
+			if cnt == wi {
+				return k
+			}
+			cnt++
+		}
+		return -1
+	}
+
+	kbdPb.SetOnPaint(func(c *wui.Canvas) {
+		cw, ch := c.Size()
+		c.FillRect(0, 0, cw, ch, wui.RGB(30, 34, 40))
+		if cw < 4 || ch < 4 || kbdWhiteCount == 0 {
+			return
+		}
+		whiteW := float64(cw) / float64(kbdWhiteCount)
+		blackW := whiteW * 0.62
+		blackH := float64(ch) * 0.62
+
+		rootKey := globalSynth.Snapshot().RootKey
+
+		// White keys.
+		wi := 0
+		for k := kbdLowKey; k <= kbdHighKey; k++ {
+			if kbdIsBlackKey(k) {
+				continue
+			}
+			x := int(float64(wi) * whiteW)
+			xEnd := int(float64(wi+1) * whiteW)
+			w1 := xEnd - x
+			var col wui.Color
+			switch {
+			case k == rootKey:
+				col = wui.RGB(70, 130, 220) // blue = root key
+			case k == previewNote:
+				col = wui.RGB(120, 200, 140) // green = preview note
+			default:
+				col = wui.RGB(250, 250, 250)
+			}
+			c.FillRect(x, 0, w1, ch, col)
+			c.DrawRect(x, 0, w1, ch-1, wui.RGB(60, 62, 70))
+			if k%12 == 0 {
+				label := fmt.Sprintf("C%d", k/12-1)
+				c.TextOut(x+3, ch-16, label, wui.RGB(120, 128, 140))
+			}
+			wi++
+		}
+
+		// Black keys.
+		whiteBefore := 0
+		for k := kbdLowKey; k <= kbdHighKey; k++ {
+			if !kbdIsBlackKey(k) {
+				whiteBefore++
+				continue
+			}
+			cx := float64(whiteBefore) * whiteW
+			x := int(cx - blackW/2)
+			w1 := int(blackW)
+			var col wui.Color
+			switch {
+			case k == rootKey:
+				col = wui.RGB(50, 90, 180)
+			case k == previewNote:
+				col = wui.RGB(80, 160, 110)
+			default:
+				col = wui.RGB(30, 32, 38)
+			}
+			c.FillRect(x, 0, w1, int(blackH), col)
+			c.DrawRect(x, 0, w1, int(blackH), wui.RGB(10, 12, 16))
+		}
+	})
+
+	kbdPb.SetOnMouseDown(func(x, y int, btn wui.MouseButton) {
+		k := hitTestKeyboard(x, y)
+		if k < 0 {
+			return
+		}
+		if isRightMouseButton(btn) {
+			// Right-click: set RootKey.
+			globalSynth.Update(func(o *SynthOptions) { o.RootKey = k })
+			ws.rootKey.SetValue(k)
+			previewValid = false
+			refreshLabel()
+			prevPb.Paint()
+			kbdPb.Paint()
+			return
+		}
+		// Left-click: play a preview of that key.
+		updatePreviewFor(k)
+		playNote(k)
+	})
 
 	sync := func() {
 		globalSynth.Update(func(o *SynthOptions) {
 			o.Waveform1 = ws.wave1.Items()[ws.wave1.SelectedIndex()]
 			o.Waveform2 = ws.wave2.Items()[ws.wave2.SelectedIndex()]
+			o.Osc1Pitch = ws.osc1Pitch.Value()
+			o.Osc2Pitch = ws.osc2Pitch.Value()
 			o.Osc2Detune = ws.osc2Detune.Value()
 			o.Osc2Mix = ws.osc2Mix.Value()
 			o.SubLevel = ws.subLevel.Value()
+			o.PulseWidth = ws.pulseWidth.Value()
+			o.Phase = ws.phase.Value()
 			o.UnisonVoices = ws.unisonVoices.Value()
 			o.UnisonDetune = ws.unisonDetune.Value()
 
@@ -5806,8 +6638,8 @@ func openSynthSettingsTool(_ *wui.Window) {
 			o.Gain = ws.gain.Value()
 			o.VelToAmp = ws.velAmp.Value()
 			o.VelToFilt = ws.velFilt.Value()
+			o.RootKey = ws.rootKey.Value()
 
-			// Sample
 			o.SampleAttack = ws.sampleAttack.Value()
 			o.SampleDecay = ws.sampleDecay.Value()
 			o.SampleSustain = ws.sampleSustain.Value()
@@ -5816,7 +6648,9 @@ func openSynthSettingsTool(_ *wui.Window) {
 			o.SamplePitch = ws.samplePitch.Value()
 		})
 		previewValid = false
+		refreshLabel()
 		prevPb.Paint()
+		kbdPb.Paint()
 	}
 
 	// ── Tab control ──
@@ -5837,30 +6671,43 @@ func openSynthSettingsTool(_ *wui.Window) {
 		panels = append(panels, p)
 	}
 
-	// Compact row pitch used inside every panel.
 	const rowH = 32
 
-	// ── Oscillator panel: 2 cols × 4 rows ──
+	// ── Oscillator panel (3 columns) ──
 	{
 		p := panels[0]
 		waveItems := []string{"sine", "square", "saw", "triangle", "noise"}
 		wave2Items := []string{"off", "sine", "square", "saw", "triangle", "noise"}
 
-		ws.wave1 = addSynthCombo(p, 15, 8, 90, 130, "Wave 1", waveItems,
+		// Col 1 (x=15): waveforms + pitches
+		ws.wave1 = addSynthCombo(p, 15, 8, 90, 110, "Wave 1", waveItems,
 			indexOf(waveItems, initial.Waveform1), func(int) { sync() })
-		ws.wave2 = addSynthCombo(p, 15, 8+rowH, 90, 130, "Wave 2", wave2Items,
+		ws.wave2 = addSynthCombo(p, 15, 8+rowH, 90, 110, "Wave 2", wave2Items,
 			indexOf(wave2Items, initial.Waveform2), func(int) { sync() })
-		ws.osc2Detune = addSynthFloat(p, 15, 8+2*rowH, 90, 130, "Detune (st)",
-			-24, 24, 2, initial.Osc2Detune, func(float64) { sync() })
-		ws.osc2Mix = addSynthFloat(p, 15, 8+3*rowH, 90, 130, "Osc2 mix",
-			0, 1, 3, initial.Osc2Mix, func(float64) { sync() })
+		ws.osc1Pitch = addSynthInt(p, 15, 8+2*rowH, 90, 110, "Osc1 pitch (st)",
+			-24, 24, initial.Osc1Pitch, func(int) { sync() })
+		ws.osc2Pitch = addSynthInt(p, 15, 8+3*rowH, 90, 110, "Osc2 pitch (st)",
+			-24, 24, initial.Osc2Pitch, func(int) { sync() })
 
-		ws.subLevel = addSynthFloat(p, 340, 8, 90, 130, "Sub level",
+		// Col 2 (x=230): mix + pulse width + sub
+		ws.osc2Detune = addSynthFloat(p, 230, 8, 90, 110, "Detune (cents)",
+			-50, 50, 1, initial.Osc2Detune, func(float64) { sync() })
+		ws.osc2Mix = addSynthFloat(p, 230, 8+rowH, 90, 110, "Osc2 mix",
+			0, 1, 3, initial.Osc2Mix, func(float64) { sync() })
+		ws.subLevel = addSynthFloat(p, 230, 8+2*rowH, 90, 110, "Sub level",
 			0, 1, 3, initial.SubLevel, func(float64) { sync() })
-		ws.unisonVoices = addSynthInt(p, 340, 8+rowH, 90, 130, "Unison v.",
+		ws.pulseWidth = addSynthFloat(p, 230, 8+3*rowH, 90, 110, "Pulse width",
+			0.05, 0.95, 2, initial.PulseWidth, func(float64) { sync() })
+
+		// Col 3 (x=445): unison + phase + root key
+		ws.unisonVoices = addSynthInt(p, 445, 8, 90, 110, "Unison voices",
 			1, 7, initial.UnisonVoices, func(int) { sync() })
-		ws.unisonDetune = addSynthFloat(p, 340, 8+2*rowH, 90, 130, "U. detune (c)",
+		ws.unisonDetune = addSynthFloat(p, 445, 8+rowH, 90, 110, "U. detune (cents)",
 			0, 50, 1, initial.UnisonDetune, func(float64) { sync() })
+		ws.phase = addSynthFloat(p, 445, 8+2*rowH, 90, 110, "Phase (0..1)",
+			0, 1, 3, initial.Phase, func(float64) { sync() })
+		ws.rootKey = addSynthInt(p, 445, 8+3*rowH, 90, 110, "Root key",
+			0, 127, initial.RootKey, func(int) { sync() })
 	}
 
 	// ── Filter panel ──
@@ -5881,7 +6728,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 			0, 1, 3, initial.FilterKeyTrack, func(float64) { sync() })
 	}
 
-	// ── Envelopes panel: two 4-knob rows ──
+	// ── Envelopes panel ──
 	{
 		p := panels[2]
 
@@ -5917,7 +6764,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 			0, 12, 2, initial.LFOPitch, func(float64) { sync() })
 	}
 
-	// ── FX panel: drive / delay / reverb stacked ──
+	// ── FX panel ──
 	{
 		p := panels[4]
 
@@ -5934,23 +6781,20 @@ func openSynthSettingsTool(_ *wui.Window) {
 		ws.revMix = addSynthFloat(p, 210, 132, 55, 70, "Mix", 0, 1, 3, initial.ReverbMix, func(float64) { sync() })
 	}
 
-	// ── Sample panel: envelope | output | user data ──
+	// ── Sample panel ──
 	{
 		p := panels[5]
 
-		// Left column — Sample envelope
 		addSynthHeader(p, 15, 4, 180, "Sample envelope")
 		ws.sampleAttack = addSynthFloat(p, 15, 26, 45, 65, "A", 0, 0.5, 4, initial.SampleAttack, func(float64) { sync() })
 		ws.sampleDecay = addSynthFloat(p, 15, 26+rowH, 45, 65, "D", 0, 0.5, 4, initial.SampleDecay, func(float64) { sync() })
 		ws.sampleSustain = addSynthFloat(p, 15, 26+2*rowH, 45, 65, "S", 0, 1, 3, initial.SampleSustain, func(float64) { sync() })
 		ws.sampleRelease = addSynthFloat(p, 15, 26+3*rowH, 45, 65, "R", 0, 0.5, 4, initial.SampleRelease, func(float64) { sync() })
 
-		// Middle column — Output
 		addSynthHeader(p, 165, 4, 130, "Output")
 		ws.sampleVolume = addSynthFloat(p, 165, 26, 45, 65, "Vol", 0, 2, 3, initial.SampleVolume, func(float64) { sync() })
 		ws.samplePitch = addSynthFloat(p, 165, 26+rowH, 45, 65, "Pitch", -24, 24, 2, initial.SamplePitch, func(float64) { sync() })
 
-		// Right column — FL Studio user data
 		addSynthHeader(p, 315, 4, 330, "FL Studio user data")
 		userLbl := newLabel("Path:", 315, 30, 40, labelH)
 		p.Add(userLbl)
@@ -5985,13 +6829,17 @@ func openSynthSettingsTool(_ *wui.Window) {
 		p.Add(userInfo)
 	}
 
-	// ── applyOptsToWidgets pushes a SynthOptions into all widgets. ──
+	// ── applyOptsToWidgets ──
 	applyOptsToWidgets := func(o SynthOptions) {
 		ws.wave1.SetSelectedIndex(indexOf(ws.wave1.Items(), o.Waveform1))
 		ws.wave2.SetSelectedIndex(indexOf(ws.wave2.Items(), o.Waveform2))
+		ws.osc1Pitch.SetValue(o.Osc1Pitch)
+		ws.osc2Pitch.SetValue(o.Osc2Pitch)
 		ws.osc2Detune.SetValue(o.Osc2Detune)
 		ws.osc2Mix.SetValue(o.Osc2Mix)
 		ws.subLevel.SetValue(o.SubLevel)
+		ws.pulseWidth.SetValue(o.PulseWidth)
+		ws.phase.SetValue(o.Phase)
 		ws.unisonVoices.SetValue(o.UnisonVoices)
 		ws.unisonDetune.SetValue(o.UnisonDetune)
 
@@ -6026,6 +6874,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 		ws.gain.SetValue(o.Gain)
 		ws.velAmp.SetValue(o.VelToAmp)
 		ws.velFilt.SetValue(o.VelToFilt)
+		ws.rootKey.SetValue(o.RootKey)
 
 		ws.sampleAttack.SetValue(o.SampleAttack)
 		ws.sampleDecay.SetValue(o.SampleDecay)
@@ -6035,10 +6884,12 @@ func openSynthSettingsTool(_ *wui.Window) {
 		ws.samplePitch.SetValue(o.SamplePitch)
 
 		previewValid = false
+		refreshLabel()
 		prevPb.Paint()
+		kbdPb.Paint()
 	}
 
-	// ── Preset store controls (top row) ──
+	// ── Preset store controls ──
 	presetLbl := newLabel("Preset:", 0, 0, 46, labelH)
 	w.Add(presetLbl)
 
@@ -6196,36 +7047,19 @@ func openSynthSettingsTool(_ *wui.Window) {
 	ws.velFilt.SetOnValueChange(func(float64) { sync() })
 	w.Add(ws.velFilt)
 
-	// ── Preview label ──
-	prevLbl := newLabel("Preview (C4 → G4)", 0, 0, 200, labelH)
-	if fontBold != nil {
-		prevLbl.SetFont(fontBold)
-	}
-	w.Add(prevLbl)
-
-	// ── Buttons ──
-	btnPreview := newBtn("Preview Note", 0, 0, 120, btnH, nil)
-	w.Add(btnPreview)
-	btnReset := newBtn("Reset", 0, 0, 80, btnH, nil)
-	w.Add(btnReset)
-	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() {
-		persistSynth()
-		w.Close()
-	})
-	w.Add(btnClose)
-
-	btnPreview.SetOnClick(func() {
-		ensureSpeakerInit()
-		cfg := globalSynth.Snapshot()
-		buf := previewBuf(cfg, 1.2)
-		swapSpeakerStream(&positionStreamer{buf: buf})
-	})
-
-	btnReset.SetOnClick(func() {
+	// ── Bottom buttons ──
+	btnReset := newBtn("Reset", 0, 0, 70, btnH, func() {
 		def := defaultSynthOptions()
 		globalSynth.Update(func(o *SynthOptions) { *o = def })
 		applyOptsToWidgets(def)
 	})
+	w.Add(btnReset)
+
+	btnClose := newBtn("Close", 0, 0, 70, btnH, func() {
+		persistSynth()
+		w.Close()
+	})
+	w.Add(btnClose)
 
 	tabs.SetOnChange(func(idx int) {
 		for i, p := range panels {
@@ -6239,7 +7073,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 		const topMargin = 12
 		const botMargin = 12
 
-		// ── Row 1: preset store ──
+		// Row 1: preset store
 		y := topMargin
 		presetLbl.SetBounds(margin, y+4, 46, labelH)
 		presetCmb.SetBounds(margin+46, y, 130, editH)
@@ -6258,7 +7092,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 
 		y += editH + smallGap
 
-		// ── Row 2: master controls ──
+		// Row 2: master controls
 		masterLbl.SetBounds(margin, y+4, 55, labelH)
 		gainLbl.SetBounds(margin+55, y+4, 36, labelH)
 		ws.gain.SetBounds(margin+91, y, 70, editH)
@@ -6269,10 +7103,13 @@ func openSynthSettingsTool(_ *wui.Window) {
 
 		y += editH + smallGap
 
-		// ── Bottom-anchored: buttons ──
+		// Bottom buttons
 		barY := ih - botMargin - btnH
+		const btnW = 70
+		btnClose.SetBounds(iw-margin-btnW, barY, btnW, btnH)
+		btnReset.SetBounds(iw-margin-2*btnW-smallGap, barY, btnW, btnH)
 
-		// ── Preview label + box fill the space between tabs and bottom bar ──
+		// Tabs
 		const tabH = 200
 		tabs.SetBounds(margin, y, iw-2*margin, tabH)
 		cx, cy, cw, chh := tabs.ContentBounds()
@@ -6281,18 +7118,31 @@ func openSynthSettingsTool(_ *wui.Window) {
 		}
 		y += tabH + smallGap
 
-		prevLbl.SetBounds(margin, y, 200, labelH)
+		// Preview label
+		prevLbl.SetBounds(margin, y, iw-2*margin, labelH)
 		y += labelH + 2
 
-		prevH := barY - y - smallGap
-		if prevH < 60 {
-			prevH = 60
+		// Preview box + piano keyboard split the remaining space
+		remaining := barY - y - smallGap
+		if remaining < 100 {
+			remaining = 100
 		}
-		prevPb.SetBounds(margin, y, iw-2*margin, prevH)
+		kbdH := remaining * 42 / 100
+		if kbdH < 46 {
+			kbdH = 46
+		}
+		if kbdH > 80 {
+			kbdH = 80
+		}
+		prevH := remaining - kbdH - smallGap
+		if prevH < 40 {
+			prevH = 40
+		}
 
-		btnPreview.SetBounds(margin, barY, 120, btnH)
-		btnReset.SetBounds(margin+120+smallGap, barY, 80, btnH)
-		btnClose.SetBounds(iw-margin-closeBtnW, barY, closeBtnW, btnH)
+		prevPb.SetBounds(margin, y, iw-2*margin, prevH)
+		y += prevH + smallGap
+
+		kbdPb.SetBounds(margin, y, iw-2*margin, kbdH)
 	})
 
 	prevPb.Paint()
