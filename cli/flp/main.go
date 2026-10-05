@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/2dprototype/flp"
+	flp "github.com/2dprototype/flp/flpdiff"
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
 )

@@ -12,7 +12,7 @@ import (
 	"sync"
 	"math"
 
-	"github.com/2dprototype/flp"
+	flp "github.com/2dprototype/flp/flpdiff"
 	"github.com/2dprototype/wui"
 
 	"gitlab.com/gomidi/midi/v2"
