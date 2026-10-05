@@ -576,6 +576,101 @@ func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64, opt
 	}
 }
 
+// renderArrangement flattens every pattern clip in an arrangement into a
+// single synthetic pattern whose notes are already positioned at their
+// absolute arrangement ticks, then hands it to renderPattern. Channel
+// (audio / automation) clips are skipped.
+//
+// Loop handling: when a clip is longer than its source pattern, the pattern
+// is repeated until the clip is filled — matching FL Studio's playlist
+// behaviour.
+func renderArrangement(arr flp.Arrangement, patterns []flp.Pattern, ppq int,
+	bpm float64, opt SynthOptions, channels []flp.Channel, flpPath string) []float64 {
+
+	patByID := make(map[int]flp.Pattern, len(patterns))
+	for _, p := range patterns {
+		patByID[p.ID] = p
+	}
+
+	// Rough capacity estimate to avoid repeated reallocation.
+	totalNotes := 0
+	for _, cl := range arr.Clips {
+		if cl.ItemIndex <= 20480 {
+			continue
+		}
+		if pat, ok := patByID[cl.ItemIndex-20480]; ok {
+			totalNotes += len(pat.Notes) * 2
+		}
+	}
+	if totalNotes < 64 {
+		totalNotes = 64
+	}
+
+	synth := flp.Pattern{
+		Notes: make([]flp.Note, 0, totalNotes),
+	}
+
+	for _, cl := range arr.Clips {
+		if cl.ItemIndex <= 20480 {
+			continue // channel clip — skip
+		}
+		patID := cl.ItemIndex - 20480
+		pat, ok := patByID[patID]
+		if !ok || len(pat.Notes) == 0 {
+			continue
+		}
+
+		// Determine the pattern's natural length for loop handling.
+		patLen := uint32(0)
+		if pat.Length != nil && *pat.Length > 0 {
+			patLen = *pat.Length
+		} else {
+			for _, n := range pat.Notes {
+				if e := n.Position + n.Length; e > patLen {
+					patLen = e
+				}
+			}
+		}
+		if patLen == 0 {
+			continue
+		}
+
+		// Number of pattern repetitions that fit inside the clip.
+		numRepeats := (cl.Length + patLen - 1) / patLen
+		if numRepeats == 0 {
+			numRepeats = 1
+		}
+
+		clipEnd := cl.Position + cl.Length
+
+		for rep := uint32(0); rep < numRepeats; rep++ {
+			repOffset := rep * patLen
+			for _, n := range pat.Notes {
+				if n.Length == 0 {
+					continue
+				}
+				absStart := cl.Position + repOffset + n.Position
+				if absStart >= clipEnd {
+					continue
+				}
+				absEnd := absStart + n.Length
+				if absEnd > clipEnd {
+					absEnd = clipEnd
+				}
+				if absEnd <= absStart {
+					continue
+				}
+				nn := n
+				nn.Position = absStart
+				nn.Length = absEnd - absStart
+				synth.Notes = append(synth.Notes, nn)
+			}
+		}
+	}
+
+	return renderPattern(synth, ppq, bpm, opt, channels, flpPath)
+}
+
 // renderPattern renders a pattern to PCM. Channels whose kind is "sampler"
 // and whose sample path resolves to a readable file are rendered with sample
 // playback (one-shot, pitch-shifted by note key). All other notes go through
@@ -1258,19 +1353,21 @@ type MIDIPlayer struct {
 func NewMIDIPlayer() *MIDIPlayer { return &MIDIPlayer{} }
 
 // PlayPattern renders pat and starts playing it through the speaker.
-// `channels` and `flpPath` let the synth route sampler-kind channels to
-// sample playback; pass nil / "" to disable.
+// Convenience wrapper around PlayBuffer for one-shot pattern playback.
 func (p *MIDIPlayer) PlayPattern(pat flp.Pattern, ppq int, bpm float64,
 	opt SynthOptions, startTick uint32, channels []flp.Channel, flpPath string) {
+	buf := renderPattern(pat, ppq, bpm, opt, channels, flpPath)
+	p.PlayBuffer(buf, ppq, bpm, startTick)
+}
 
-	// Serialize concurrent PlayPattern calls (e.g. two rapid button presses
-	// while the previous render is still ongoing).
+// PlayBuffer starts playing a pre-rendered PCM buffer. This is the fast path
+// for arrangement playback where the buffer is cached across plays.
+func (p *MIDIPlayer) PlayBuffer(buf []float64, ppq int, bpm float64, startTick uint32) {
 	p.playMu.Lock()
 	defer p.playMu.Unlock()
 
 	ensureSpeakerInit()
 
-	buf := renderPattern(pat, ppq, bpm, opt, channels, flpPath)
 	stream := &positionStreamer{buf: buf}
 
 	if bpm > 0 && ppq > 0 {
@@ -2892,12 +2989,15 @@ type vizState struct {
 	dragStartScrollX int
 	dragStartScrollY int
 
-	patternIdx int
+	patternIdx     int
+	arrangementIdx int
 
 	player     *MIDIPlayer
 	playTimer  *wui.Timer
 	manualTick uint32
 	synth      *SynthConfig
+
+	arrCache arrangementCache
 }
 
 // scrubToTick updates the playhead position (and seeks the audio if playing).
@@ -2914,6 +3014,25 @@ func (s *vizState) currentTick() uint32 {
 		return s.player.TickPosition()
 	}
 	return s.manualTick
+}
+
+// arrangementCache holds a fully-rendered arrangement buffer. When the
+// project pointer, arrangement index and synth options are all unchanged
+// since the last render, the cached buffer is reused so re-clicking Play is
+// instantaneous even on large arrangements.
+type arrangementCache struct {
+	projectPtr *flp.FLPProject
+	arrIdx     int
+	opts       SynthOptions
+	buf        []float64
+	valid      bool
+}
+
+func (c *arrangementCache) matches(project *flp.FLPProject, arrIdx int, opts SynthOptions) bool {
+	return c.valid &&
+		c.projectPtr == project &&
+		c.arrIdx == arrIdx &&
+		c.opts == opts
 }
 
 func openVisualizerTool(_ *wui.Window) {
@@ -2957,28 +3076,61 @@ func openVisualizerTool(_ *wui.Window) {
 	w.Add(btnClose)
 
 	s := &vizState{
-		project:    app.Project,
-		source:     app.Path,
-		view:       "arrangement",
-		zoomX:      1,
-		zoomY:      1,
-		patternIdx: 0,
-		player:     NewMIDIPlayer(),
-		synth:      globalSynth,
+		project:        app.Project,
+		source:         app.Path,
+		view:           "arrangement",
+		zoomX:          1,
+		zoomY:          1,
+		patternIdx:     0,
+		arrangementIdx: 0,
+		player:         NewMIDIPlayer(),
+		synth:          globalSynth,
 	}
 
-	patItems := make([]string, len(s.project.Patterns))
-	for i, pt := range s.project.Patterns {
-		n := fmt.Sprintf("#%d", pt.ID)
-		if pt.Name != nil && *pt.Name != "" {
-			n = *pt.Name
+	// ── Repopulate the selection combo based on the current view ──
+	refreshSelection := func() {
+		if s.view == "arrangement" {
+			lblPat.SetText("Arr.:")
+			items := make([]string, len(s.project.Arrangements))
+			for i, a := range s.project.Arrangements {
+				n := fmt.Sprintf("#%d", a.ID)
+				if a.Name != nil && *a.Name != "" {
+					n = *a.Name
+				}
+				items[i] = fmt.Sprintf("%d: %s", i, n)
+			}
+			if len(items) == 0 {
+				items = []string{"(no arrangements)"}
+			}
+			patCmb.SetItems(items)
+			if s.arrangementIdx >= 0 && s.arrangementIdx < len(items) {
+				patCmb.SetSelectedIndex(s.arrangementIdx)
+			} else {
+				s.arrangementIdx = 0
+				patCmb.SetSelectedIndex(0)
+			}
+		} else {
+			lblPat.SetText("Pattern:")
+			items := make([]string, len(s.project.Patterns))
+			for i, pt := range s.project.Patterns {
+				n := fmt.Sprintf("#%d", pt.ID)
+				if pt.Name != nil && *pt.Name != "" {
+					n = *pt.Name
+				}
+				items[i] = fmt.Sprintf("%d: %s", i, n)
+			}
+			if len(items) == 0 {
+				items = []string{"(no patterns)"}
+			}
+			patCmb.SetItems(items)
+			if s.patternIdx >= 0 && s.patternIdx < len(items) {
+				patCmb.SetSelectedIndex(s.patternIdx)
+			} else {
+				s.patternIdx = 0
+				patCmb.SetSelectedIndex(0)
+			}
 		}
-		patItems[i] = fmt.Sprintf("%d: %s", i, n)
 	}
-	if len(patItems) == 0 {
-		patItems = []string{"(no patterns)"}
-	}
-	patCmb.SetItems(patItems)
 
 	applyLayout(w, func(iw, ih int) {
 		contentW := iw - 2*margin
@@ -3058,6 +3210,7 @@ func openVisualizerTool(_ *wui.Window) {
 		stopPlayback()
 		s.view = cmb.Items()[cmb.SelectedIndex()]
 		s.scrollX, s.scrollY = 0, 0
+		refreshSelection()
 		if s.view == "pianoroll" {
 			centerPianoRoll(s)
 		}
@@ -3069,13 +3222,18 @@ func openVisualizerTool(_ *wui.Window) {
 			return
 		}
 		stopPlayback()
-		s.patternIdx = i
-		s.manualTick = 0
-		if s.view == "pianoroll" {
-			centerPianoRoll(s)
-			s.scrollX = 0
-			pb.Paint()
+		if s.view == "arrangement" {
+			s.arrangementIdx = i
+			s.manualTick = 0
+		} else {
+			s.patternIdx = i
+			s.manualTick = 0
+			if s.view == "pianoroll" {
+				centerPianoRoll(s)
+				s.scrollX = 0
+			}
 		}
+		pb.Paint()
 	})
 
 	btnZoomIn.SetOnClick(func() {
@@ -3103,10 +3261,7 @@ func openVisualizerTool(_ *wui.Window) {
 			stopPlayback()
 			return
 		}
-		if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
-			return
-		}
-		pat := s.project.Patterns[s.patternIdx]
+
 		bpm := 120.0
 		if t := flp.GetTempo(s.project); t != nil {
 			bpm = *t
@@ -3115,7 +3270,45 @@ func openVisualizerTool(_ *wui.Window) {
 		if ppq <= 0 {
 			ppq = 96
 		}
-		s.player.PlayPattern(pat, ppq, bpm, s.synth.Snapshot(), s.manualTick, s.project.Channels, s.source)
+
+		if s.view == "arrangement" {
+			// ── Arrangement playback with cache ──
+			if s.arrangementIdx < 0 || s.arrangementIdx >= len(s.project.Arrangements) {
+				return
+			}
+			opts := s.synth.Snapshot()
+
+			var buf []float64
+			if s.arrCache.matches(s.project, s.arrangementIdx, opts) {
+				// Fast path — buffer already rendered.
+				buf = s.arrCache.buf
+			} else {
+				arr := s.project.Arrangements[s.arrangementIdx]
+				buf = renderArrangement(arr, s.project.Patterns, ppq, bpm,
+					opts, s.project.Channels, s.source)
+				s.arrCache = arrangementCache{
+					projectPtr: s.project,
+					arrIdx:     s.arrangementIdx,
+					opts:       opts,
+					buf:        buf,
+					valid:      true,
+				}
+			}
+
+			if len(buf) == 0 {
+				return
+			}
+			s.player.PlayBuffer(buf, ppq, bpm, s.manualTick)
+		} else {
+			// ── Pattern playback (existing path) ──
+			if s.patternIdx < 0 || s.patternIdx >= len(s.project.Patterns) {
+				return
+			}
+			pat := s.project.Patterns[s.patternIdx]
+			s.player.PlayPattern(pat, ppq, bpm, s.synth.Snapshot(),
+				s.manualTick, s.project.Channels, s.source)
+		}
+
 		btnPlay.SetText("Stop")
 		s.playTimer.Start()
 	})
@@ -3180,19 +3373,21 @@ func openVisualizerTool(_ *wui.Window) {
 			pb.Paint()
 			return
 		}
-		if handlePianoRollScrub(s, lx, ly) {
+		if handleTimelineScrub(s, lx, ly) {
 			pb.Paint()
 		}
 	})
+	
 	w.SetOnMouseUp(func(_ wui.MouseButton, x, y int) {
 		s.dragMode = 0
 	})
+	
 	pb.SetOnMouseMove(func(x, y int) {
 		if s.dragMode == 0 {
 			return
 		}
 		if s.dragMode == 3 {
-			if handlePianoRollScrub(s, x, y) {
+			if handleTimelineScrub(s, x, y) {
 				pb.Paint()
 			}
 			return
@@ -3215,25 +3410,42 @@ func openVisualizerTool(_ *wui.Window) {
 		}
 	})
 
+	// Populate the combo based on the initial view ("arrangement").
+	refreshSelection()
+
 	defer stopPlayback()
 	showModal(w)
 }
 
-// handlePianoRollScrub converts a mouse coordinate inside the piano roll into
-// a tick position and updates the playhead. Returns true if the click landed
-// inside the scrub area.
-func handlePianoRollScrub(s *vizState, lx, ly int) bool {
-	if s.view != "pianoroll" {
+// handleTimelineScrub converts a mouse coordinate inside the timeline view
+// (pianoroll or arrangement) into a tick position and updates the playhead.
+// The user can click anywhere in the ruler or the content area to reposition
+// the playhead; holding the mouse down and dragging keeps updating it.
+//
+//   - pianoroll   → x < pianoKeysW  is the piano keyboard; anything right is the grid
+//   - arrangement → x < trackHdrW   is the track header column; anything right is the grid
+//
+// Returns true if the click landed inside the scrub area.
+func handleTimelineScrub(s *vizState, lx, ly int) bool {
+	var leftW int
+	switch s.view {
+	case "pianoroll":
+		leftW = pianoKeysW
+	case "arrangement":
+		leftW = trackHdrW
+	default:
 		return false
 	}
-	if lx < pianoKeysW || lx >= s.pbW-scrollbarSize {
+	if lx < leftW || lx >= s.pbW-scrollbarSize {
 		return false
 	}
-	if ly < vizHeaderH+rulerH || ly >= s.pbH-scrollbarSize {
+	// Allow seeking from the ruler down (skips only the top header bar
+	// and the scrollbars).
+	if ly < vizHeaderH || ly >= s.pbH-scrollbarSize {
 		return false
 	}
 	pxPerTick := basePxPerTick * s.zoomX
-	tick := float64(lx-pianoKeysW+s.scrollX) / pxPerTick
+	tick := float64(lx-leftW+s.scrollX) / pxPerTick
 	if tick < 0 {
 		tick = 0
 	}
@@ -3679,6 +3891,26 @@ func drawArrangementView(c *wui.Canvas, s *vizState) {
 			cy += trackH
 		}
 		cy += 10
+	}
+
+	// ── playback cursor ────────────────────────────────────────────
+	// Always drawn: shows the scrub position when idle, live position when
+	// playing. The user can click/drag anywhere in the ruler or content
+	// area to reposition — see handleTimelineScrub.
+	var pos uint32
+	if s.player != nil && s.player.IsPlaying() {
+		pos = s.player.TickPosition()
+	} else {
+		pos = s.manualTick
+	}
+	cx := trackHdrW + int(float64(pos)*pxPerTick) - s.scrollX
+	if cx >= trackHdrW && cx <= s.vpW {
+		cursorCol := wui.RGB(220, 60, 60)
+		// Full-height line down the timeline.
+		c.Line(cx, contentY, cx, contentY+s.vpH, cursorCol)
+		// Small square cap in the ruler so it's easy to spot and grab.
+		c.FillRect(cx-4, contentY+rulerH-9, 9, 9, cursorCol)
+		c.Line(cx-4, contentY+rulerH, cx+5, contentY+rulerH, colSep)
 	}
 }
 
