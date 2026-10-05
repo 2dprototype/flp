@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"math"
 
 	flp "github.com/2dprototype/flp/flpdiff"
+	"github.com/2dprototype/flp/pyflp"
 	"github.com/2dprototype/wui"
 
 	"gitlab.com/gomidi/midi/v2"
@@ -2131,7 +2135,502 @@ func loadProject(path string) (*flp.FLPProject, error) {
 	if err != nil {
 		return nil, err
 	}
-	return flp.ParseFLPFile(buf)
+	return duoLoad(buf) // flpdiff + pyflp arrangement parsing
+}
+
+// ───────────────────────── /duo: flpdiff + pyflp arrangement parsing ─────────────────────────
+//
+// flpdiff stays the project model (editing / serialization), but it cannot
+// decode the arrangement data of some FL Studio versions. pyflp can, and it
+// also exposes things flpdiff doesn't (resolved playlist items, performance
+// settings of tracks, current arrangement, loop points, time signature,
+// per-version track limits ...). duoLoad parses with both, repairs the
+// arrangements by merging the richer parse of each, and keeps the
+// pyflp-only extras in a duoInfo for the UI.
+
+type duoClipExtra struct {
+	Kind        string // "channel" | "pattern" | "unknown"
+	Label       string // resolved channel / pattern name
+	Group       int64
+	StartOffset float64
+	EndOffset   float64
+}
+
+type duoTrackExtra struct {
+	ContentLocked bool
+	Height        string
+	Motion        string
+	Press         string
+	PositionSync  string
+	TriggerSync   string
+	Tolerant      bool
+	Queued        bool
+	Icon          int64
+	Items         int
+}
+
+type duoArrInfo struct {
+	ID      int
+	Name    string
+	Tracks  []duoTrackExtra
+	Markers []string
+	Clips   map[[4]int]duoClipExtra
+}
+
+type duoInfo struct {
+	Source     string // "flpdiff" | "pyflp" | "merged"
+	Notes      []string
+	PyflpErr   error
+	Version    string
+	Current    int // zero-based index of FL's selected arrangement, -1 = unknown
+	HasLoop    bool
+	LoopStart  int64
+	LoopEnd    int64
+	SigNum     int64
+	SigBeat    int64
+	MaxTracks  int
+	Arrangemts map[int]*duoArrInfo // by arrangement ID
+}
+
+var (
+	duoMu       sync.Mutex
+	duoLastProj *flp.FLPProject
+	duoLastInfo *duoInfo
+)
+
+func duoSetCache(p *flp.FLPProject, info *duoInfo) {
+	duoMu.Lock()
+	duoLastProj, duoLastInfo = p, info
+	duoMu.Unlock()
+}
+
+// duoInfoFor returns the pyflp extras for p, recomputing them (serialize +
+// pyflp parse) when p isn't the project the cache was built for.
+func duoInfoFor(p *flp.FLPProject) *duoInfo {
+	if p == nil {
+		return nil
+	}
+	duoMu.Lock()
+	if duoLastProj == p && duoLastInfo != nil {
+		info := duoLastInfo
+		duoMu.Unlock()
+		return info
+	}
+	duoMu.Unlock()
+	data, err := flp.SerializeFLPProject(p)
+	if err != nil {
+		return nil
+	}
+	_, info := duoApply(p, data, false)
+	return info
+}
+
+// duoLoad parses FLP bytes with flpdiff, then repairs arrangements via pyflp.
+func duoLoad(data []byte) (*flp.FLPProject, error) {
+	p, err := flp.ParseFLPFile(data)
+	if err != nil {
+		return nil, err
+	}
+	duoApply(p, data, true)
+	return p, nil
+}
+
+// duoFix re-runs the duo repair on a project returned by an edit (flpdiff
+// rebuilds its arrangements from events on every edit, which would lose the
+// pyflp-recovered data again).
+func duoFix(p *flp.FLPProject) *flp.FLPProject {
+	if p == nil {
+		return p
+	}
+	data, err := flp.SerializeFLPProject(p)
+	if err != nil {
+		return p
+	}
+	duoApply(p, data, true)
+	return p
+}
+
+// duoCarry moves arrangement data (and the pyflp extras) from old to next
+// when an edit can't have touched arrangements (e.g. note edits).
+func duoCarry(old, next *flp.FLPProject) {
+	if old == nil || next == nil || old == next {
+		return
+	}
+	next.Arrangements = old.Arrangements
+	duoMu.Lock()
+	if duoLastProj == old {
+		duoLastProj = next
+	}
+	duoMu.Unlock()
+}
+
+// duoApply parses data with pyflp and (when repair is true) replaces
+// p.Arrangements by the merged result. Never panics.
+func duoApply(p *flp.FLPProject, data []byte, repair bool) (outP *flp.FLPProject, outInfo *duoInfo) {
+	info := &duoInfo{Source: "flpdiff", Current: -1, Arrangemts: map[int]*duoArrInfo{}}
+	defer func() {
+		if r := recover(); r != nil {
+			info.PyflpErr = fmt.Errorf("pyflp panic: %v", r)
+			info.Notes = append(info.Notes, info.PyflpErr.Error())
+		}
+		outP, outInfo = p, info
+		duoSetCache(p, info)
+	}()
+
+	pp, err := pyflp.ParseBytes(data)
+	if err != nil {
+		info.PyflpErr = err
+		info.Notes = append(info.Notes, "pyflp failed: "+err.Error())
+		return p, info
+	}
+	if v, verr := pp.Version(); verr == nil {
+		info.Version = v.String()
+	}
+
+	arrs := pp.Arrangements()
+	info.MaxTracks = arrs.MaxTracks()
+	ts := arrs.TimeSignature()
+	info.SigNum, _ = ts.Int("num")
+	info.SigBeat, _ = ts.Int("beat")
+	if lp, ok := arrs.LoopPos(); ok {
+		info.HasLoop, info.LoopStart, info.LoopEnd = true, lp[0], lp[1]
+	}
+	pyList, aerr := arrs.All()
+	if aerr != nil && !errors.Is(aerr, pyflp.ErrNoModelsFound) {
+		info.PyflpErr = aerr
+		info.Notes = append(info.Notes, "pyflp arrangements failed: "+aerr.Error())
+		return p, info
+	}
+	if cur, cerr := arrs.Current(); cerr == nil && cur != nil {
+		for i, a := range pyList {
+			if a.IID() == cur.IID() {
+				info.Current = i
+				break
+			}
+		}
+	}
+
+	chIids := map[int]bool{}
+	for _, c := range p.Channels {
+		chIids[c.Iid] = true
+	}
+	patIDs := map[int]bool{}
+	for _, pt := range p.Patterns {
+		patIDs[pt.ID] = true
+	}
+	keep := func(c flp.Clip) bool {
+		if c.TrackRvidx > 499 {
+			return false
+		}
+		if c.ItemIndex <= 20480 {
+			return chIids[c.ItemIndex]
+		}
+		return patIDs[c.ItemIndex-20480]
+	}
+
+	var conv []flp.Arrangement
+	for _, a := range pyList {
+		arr := flp.Arrangement{ID: int(a.IID()), Tracks: []flp.Track{}, Clips: []flp.Clip{}, TimeMarkers: []flp.TimeMarker{}}
+		ai := &duoArrInfo{ID: arr.ID, Clips: map[[4]int]duoClipExtra{}}
+		if n, ok := a.Str("name"); ok {
+			s := n
+			arr.Name = &s
+			ai.Name = n
+		}
+
+		for ti, t := range a.Tracks() {
+			tr := flp.Track{Index: ti}
+			if v, ok := t.Int("iid"); ok {
+				tr.Iid = flp.Ptr(uint32(v))
+			}
+			if n, ok := t.Str("name"); ok {
+				s := n
+				tr.Name = &s
+			}
+			if c, ok := t.Color("color"); ok {
+				if b := c.Bytes(); len(b) >= 4 {
+					tr.Color = &flp.RGBA{R: int(b[0]), G: int(b[1]), B: int(b[2]), A: int(b[3])}
+				}
+			}
+			if v, ok := t.Int("icon"); ok {
+				tr.Icon = flp.Ptr(uint32(v))
+			}
+			if v, ok := t.Bool("enabled"); ok {
+				tr.Enabled = flp.Ptr(v)
+			}
+			if v, ok := t.Bool("locked"); ok {
+				tr.Locked = flp.Ptr(v)
+			}
+			if v, ok := t.Bool("grouped"); ok {
+				tr.Grouped = flp.Ptr(v)
+			}
+			arr.Tracks = append(arr.Tracks, tr)
+
+			ex := duoTrackExtra{Items: t.Len()}
+			ex.ContentLocked, _ = t.Bool("content_locked")
+			ex.Tolerant, _ = t.Bool("tolerant")
+			ex.Queued, _ = t.Bool("queued")
+			ex.Icon, _ = t.Int("icon")
+			ex.Height, _ = t.Str("height")
+			enumStr := func(name string) string {
+				v, ok := t.Get(name)
+				if !ok {
+					return ""
+				}
+				return fmt.Sprint(pyflp.FormatValue(t.Spec(name), v, false))
+			}
+			ex.Motion = enumStr("motion")
+			ex.Press = enumStr("press")
+			ex.PositionSync = enumStr("position_sync")
+			ex.TriggerSync = enumStr("trigger_sync")
+			ai.Tracks = append(ai.Tracks, ex)
+
+			for _, it := range t.Items() {
+				pos, _ := it.Int("position")
+				ln, _ := it.Int("length")
+				idx, _ := it.Int("item_index")
+				rv, _ := it.Int("track_rvidx")
+				grp, _ := it.Int("group")
+				fl, _ := it.Int("item_flags")
+				so, _ := it.Float("start_offset")
+				eo, _ := it.Float("end_offset")
+				c := flp.Clip{
+					Position: uint32(pos), ItemIndex: int(idx), Length: uint32(ln),
+					TrackRvidx: int(rv), Group: int(grp), ItemFlags: int(fl),
+					StartOffset: float32(so), EndOffset: float32(eo),
+				}
+				if !keep(c) {
+					continue
+				}
+				arr.Clips = append(arr.Clips, c)
+				ce := duoClipExtra{Kind: "unknown", Group: grp, StartOffset: so, EndOffset: eo}
+				if it.Pattern != nil {
+					ce.Kind = "pattern"
+					ce.Label, _ = it.Pattern.Str("name")
+				} else if it.Channel != nil {
+					ce.Kind = "channel"
+					ce.Label = it.Channel.DisplayName()
+				}
+				ai.Clips[[4]int{int(pos), int(idx), int(rv), int(ln)}] = ce
+			}
+		}
+		sort.SliceStable(arr.Clips, func(i, j int) bool {
+			if arr.Clips[i].Position != arr.Clips[j].Position {
+				return arr.Clips[i].Position < arr.Clips[j].Position
+			}
+			return arr.Clips[i].TrackRvidx > arr.Clips[j].TrackRvidx
+		})
+
+		for _, m := range a.TimeMarkers() {
+			pos, _ := m.Int("position")
+			tm := flp.TimeMarker{Kind: flp.TimeMarkerMarker, Position: uint32(pos)}
+			if typ, _ := m.Int("type"); typ == int64(pyflp.TimeMarkerTypeSignature) {
+				tm.Kind = flp.TimeMarkerSignature
+			}
+			if n, ok := m.Str("name"); ok {
+				s := n
+				tm.Name = &s
+			}
+			if v, ok := m.Int("numerator"); ok {
+				tm.Numerator = flp.Ptr(int(v))
+			}
+			if v, ok := m.Int("denominator"); ok {
+				tm.Denominator = flp.Ptr(int(v))
+			}
+			arr.TimeMarkers = append(arr.TimeMarkers, tm)
+			info.addMarker(ai, tm)
+		}
+		info.Arrangemts[arr.ID] = ai
+		conv = append(conv, arr)
+	}
+
+	if !repair {
+		return p, info
+	}
+	merged, changed := duoMerge(p.Arrangements, conv, info)
+	if changed {
+		p.Arrangements = merged
+		info.Source = "merged"
+		if len(p.Arrangements) > 0 && len(conv) > 0 && len(p.Arrangements) == len(conv) {
+			// keep Source accurate when pyflp supplied everything
+			allPy := true
+			for i := range conv {
+				if len(p.Arrangements[i].Clips) != len(conv[i].Clips) {
+					allPy = false
+				}
+			}
+			if allPy {
+				info.Source = "pyflp"
+			}
+		}
+	}
+	return p, info
+}
+
+func (info *duoInfo) addMarker(ai *duoArrInfo, tm flp.TimeMarker) {
+	name := ""
+	if tm.Name != nil {
+		name = *tm.Name
+	}
+	if tm.Kind == flp.TimeMarkerSignature {
+		n, d := 4, 4
+		if tm.Numerator != nil {
+			n = *tm.Numerator
+		}
+		if tm.Denominator != nil {
+			d = *tm.Denominator
+		}
+		ai.Markers = append(ai.Markers, fmt.Sprintf("@%d  signature %d/%d %s", tm.Position, n, d, name))
+		return
+	}
+	if name == "" {
+		name = "(unnamed)"
+	}
+	ai.Markers = append(ai.Markers, fmt.Sprintf("@%d  marker %s", tm.Position, name))
+}
+
+func duoScore(a flp.Arrangement) int {
+	return len(a.Clips)*1000 + len(a.Tracks)*10 + len(a.TimeMarkers)
+}
+
+func duoClipKey(c flp.Clip) [4]int {
+	return [4]int{int(c.Position), c.ItemIndex, c.TrackRvidx, int(c.Length)}
+}
+
+// duoMerge picks, per arrangement, the richer of the flpdiff / pyflp parses
+// and fills gaps (names, colours, tracks, markers, missing clips) from the
+// other one.
+func duoMerge(fd, py []flp.Arrangement, info *duoInfo) ([]flp.Arrangement, bool) {
+	if len(py) == 0 {
+		return fd, false
+	}
+	if len(fd) == 0 {
+		info.Notes = append(info.Notes, fmt.Sprintf("flpdiff found no arrangements; using pyflp (%d)", len(py)))
+		return py, true
+	}
+	pyByID := map[int]int{}
+	for i, a := range py {
+		pyByID[a.ID] = i
+	}
+	used := map[int]bool{}
+	changed := false
+	out := make([]flp.Arrangement, 0, len(fd))
+	for i, a := range fd {
+		pi, ok := pyByID[a.ID]
+		if !ok {
+			if i < len(py) {
+				pi, ok = i, true
+			}
+		}
+		if !ok {
+			out = append(out, a)
+			continue
+		}
+		used[pi] = true
+		base, other := a, py[pi]
+		fromPy := false
+		if duoScore(other) > duoScore(base) {
+			base, other = other, base
+			fromPy = true
+			changed = true
+			info.Notes = append(info.Notes, fmt.Sprintf("arrangement %d: pyflp richer (clips %d vs %d, tracks %d vs %d)",
+				a.ID, len(py[pi].Clips), len(a.Clips), len(py[pi].Tracks), len(a.Tracks)))
+		}
+		// Copy slices so we never alias the other parse.
+		base.Tracks = append([]flp.Track{}, base.Tracks...)
+		base.Clips = append([]flp.Clip{}, base.Clips...)
+		if base.Name == nil && other.Name != nil {
+			base.Name, changed = other.Name, true
+		}
+		for ti := len(base.Tracks); ti < len(other.Tracks); ti++ {
+			base.Tracks = append(base.Tracks, other.Tracks[ti])
+			changed = true
+		}
+		for ti := range base.Tracks {
+			if ti >= len(other.Tracks) {
+				break
+			}
+			bt, ot := &base.Tracks[ti], other.Tracks[ti]
+			if bt.Name == nil && ot.Name != nil {
+				bt.Name, changed = ot.Name, true
+			}
+			if bt.Color == nil && ot.Color != nil {
+				bt.Color, changed = ot.Color, true
+			}
+			if bt.Iid == nil && ot.Iid != nil {
+				bt.Iid, changed = ot.Iid, true
+			}
+		}
+		if len(base.TimeMarkers) == 0 && len(other.TimeMarkers) > 0 {
+			base.TimeMarkers, changed = other.TimeMarkers, true
+		}
+		seen := map[[4]int]bool{}
+		for _, c := range base.Clips {
+			seen[duoClipKey(c)] = true
+		}
+		added := 0
+		for _, c := range other.Clips {
+			if !seen[duoClipKey(c)] {
+				base.Clips = append(base.Clips, c)
+				added++
+			}
+		}
+		if added > 0 {
+			sort.SliceStable(base.Clips, func(x, y int) bool { return base.Clips[x].Position < base.Clips[y].Position })
+			who := "pyflp"
+			if fromPy {
+				who = "flpdiff"
+			}
+			info.Notes = append(info.Notes, fmt.Sprintf("arrangement %d: +%d clips recovered from %s", a.ID, added, who))
+			changed = true
+		}
+		out = append(out, base)
+	}
+	for i := range py {
+		if !used[i] && i >= len(fd) {
+			out = append(out, py[i])
+			info.Notes = append(info.Notes, fmt.Sprintf("arrangement %d only found by pyflp", py[i].ID))
+			changed = true
+		}
+	}
+	return out, changed
+}
+
+// duoProjectText is the pyflp-only project info shown in the tree view.
+func duoProjectText(info *duoInfo, p *flp.FLPProject) string {
+	if info == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n── pyflp / duo ──\n")
+	fmt.Fprintf(&b, "Arrangement source: %s\n", info.Source)
+	if info.Version != "" {
+		fmt.Fprintf(&b, "FL Studio version (pyflp): %s\n", info.Version)
+	}
+	if info.SigNum > 0 {
+		fmt.Fprintf(&b, "Time signature (pyflp): %d/%d\n", info.SigNum, info.SigBeat)
+	}
+	if info.MaxTracks > 0 {
+		fmt.Fprintf(&b, "Max playlist tracks: %d\n", info.MaxTracks)
+	}
+	if info.HasLoop {
+		fmt.Fprintf(&b, "Playlist loop: %d → %d ticks\n", info.LoopStart, info.LoopEnd)
+	}
+	if info.Current >= 0 && p != nil && info.Current < len(p.Arrangements) {
+		a := p.Arrangements[info.Current]
+		nm := fmt.Sprintf("#%d", a.ID)
+		if a.Name != nil && *a.Name != "" {
+			nm = *a.Name
+		}
+		fmt.Fprintf(&b, "Selected arrangement: %s\n", nm)
+	}
+	if info.PyflpErr != nil {
+		fmt.Fprintf(&b, "pyflp error: %v\n", info.PyflpErr)
+	}
+	for _, n := range info.Notes {
+		fmt.Fprintf(&b, "• %s\n", n)
+	}
+	return b.String()
 }
 
 func formatErr(err error) string {
@@ -3165,7 +3664,7 @@ func openEditTool(_ *wui.Window) {
 				cat.label, itemIndex, vals, err)
 			return
 		}
-		app.Project = next
+		app.Project = duoFix(next)
 		app.OnUpdate()
 		status.SetText(cat.msg(itemIndex, vals))
 		refreshItems()
@@ -3217,7 +3716,7 @@ func openInspectTool(_ *wui.Window) {
 
 	lblFmt := newLabel("Format:", 0, 0, 60, labelH)
 	w.Add(lblFmt)
-	cmb := newCombo([]string{"text", "canonical", "json"}, 0, 0, 140, editH)
+	cmb := newCombo([]string{"text", "canonical", "json", "pyflp", "duo"}, 0, 0, 140, editH)
 	w.Add(cmb)
 
 	btnShow := newBtn("Refresh", 0, 0, 100, btnH, nil)
@@ -3261,6 +3760,24 @@ func openInspectTool(_ *wui.Window) {
 				return
 			}
 			setText(out, trimForUI(s))
+		case "pyflp":
+			pp, perr := assetPyflpParse(app.Project)
+			if perr != nil {
+				setText(out, formatErr(perr))
+				return
+			}
+			s, jerr := marshalIndentedJSON(pp.Dump(true))
+			if jerr != nil {
+				setText(out, formatErr(jerr))
+				return
+			}
+			setText(out, trimForUI(strings.Join(pp.Summary(), "\n")+"\n\n"+s))
+		case "duo":
+			txt := duoProjectText(duoInfoFor(app.Project), app.Project)
+			if pp, perr := assetPyflpParse(app.Project); perr == nil {
+				txt += "\n" + strings.Join(pp.Summary(), "\n") + "\n"
+			}
+			setText(out, txt+"\n"+flp.RenderInfo(app.Project, app.Path))
 		default:
 			header := timestampsText(app.Project, app.Path) + "\n\n"
 			setText(out, header+flp.RenderInfo(app.Project, app.Path))
@@ -4350,6 +4867,7 @@ func vizReplacePatternNotes(s *vizState, patternIdx int, notes []flp.Note) bool 
 			break
 		}
 	}
+	duoCarry(s.project, updated)
 	s.project = updated
 	app.Project = updated
 	s.arrCache.valid = false
@@ -5894,9 +6412,10 @@ func openAssetTool(_ *wui.Window) {
 		fmt.Fprintf(&b, "Patterns:       %d\n", len(p.Patterns))
 		fmt.Fprintf(&b, "Mixer inserts:  %d\n", len(p.Inserts))
 		fmt.Fprintf(&b, "Arrangements:   %d\n", len(p.Arrangements))
+		b.WriteString(duoProjectText(duoInfoFor(p), p))
 		return b.String()
 	}
-	rootNode := addNode(nil, "Project", "Project", projDetail(), nil)
+	rootNode := addNode(nil, "Project (duo view)", "Project", projDetail(), nil)
 
 	// ── Channels (with sample + plugin sub-nodes) ────────────────────
 	chCat := addNode(rootNode, fmt.Sprintf("Channels (%d)", len(p.Channels)),
@@ -6119,6 +6638,7 @@ func openAssetTool(_ *wui.Window) {
 	// ── Arrangements / tracks / clips ────────────────────────────────
 	arrCat := addNode(rootNode, fmt.Sprintf("Arrangements (%d)", len(p.Arrangements)),
 		"Arrangements", "All arrangements, tracks and clips.", nil)
+	di := duoInfoFor(p)
 	for _, a := range p.Arrangements {
 		arr := a
 		name := fmt.Sprintf("#%d", arr.ID)
@@ -6133,6 +6653,17 @@ func openAssetTool(_ *wui.Window) {
 			}
 			fmt.Fprintf(&b, "Tracks: %d\n", len(arr.Tracks))
 			fmt.Fprintf(&b, "Clips:  %d\n", len(arr.Clips))
+			if di != nil {
+				if di.Current >= 0 && di.Current < len(p.Arrangements) && p.Arrangements[di.Current].ID == arr.ID {
+					b.WriteString("Selected in FL Studio: yes\n")
+				}
+				if ai := di.Arrangemts[arr.ID]; ai != nil && len(ai.Markers) > 0 {
+					fmt.Fprintf(&b, "Time markers (%d):\n", len(ai.Markers))
+					for _, m := range ai.Markers {
+						fmt.Fprintf(&b, "  %s\n", m)
+					}
+				}
+			}
 			return b.String()
 		}
 		arrNode := addNode(arrCat, fmt.Sprintf("%d: %s", arr.ID, name),
@@ -6164,6 +6695,20 @@ func openAssetTool(_ *wui.Window) {
 					fmt.Fprintf(&b, "Color: rgba(%d,%d,%d,%d)\n",
 						track.Color.R, track.Color.G, track.Color.B, track.Color.A)
 				}
+				if di != nil {
+					if ai := di.Arrangemts[arr.ID]; ai != nil && ti < len(ai.Tracks) {
+						x := ai.Tracks[ti]
+						fmt.Fprintf(&b, "Playlist items: %d\n", x.Items)
+						if x.Height != "" {
+							fmt.Fprintf(&b, "Height: %s\n", x.Height)
+						}
+						fmt.Fprintf(&b, "Content locked: %v\n", x.ContentLocked)
+						fmt.Fprintf(&b, "Icon: %d\n", x.Icon)
+						fmt.Fprintf(&b, "Motion: %s   Press: %s\n", x.Motion, x.Press)
+						fmt.Fprintf(&b, "Position sync: %s   Trigger sync: %s\n", x.PositionSync, x.TriggerSync)
+						fmt.Fprintf(&b, "Tolerant: %v   Queued: %v\n", x.Tolerant, x.Queued)
+					}
+				}
 				return b.String()
 			}
 			trNode := addNode(arrNode, tname, tname, tdetail(), nil)
@@ -6178,12 +6723,29 @@ func openAssetTool(_ *wui.Window) {
 					fmt.Fprintf(&b, "Length: %d ticks\n", clip.Length)
 					fmt.Fprintf(&b, "Item index: %d\n", clip.ItemIndex)
 					fmt.Fprintf(&b, "Track row index: %d\n", 499-clip.TrackRvidx)
+					if di != nil {
+						if ai := di.Arrangemts[arr.ID]; ai != nil {
+							if ce, ok := ai.Clips[duoClipKey(clip)]; ok {
+								fmt.Fprintf(&b, "Kind (pyflp): %s\n", ce.Kind)
+								if ce.Label != "" {
+									fmt.Fprintf(&b, "Resolved name: %s\n", ce.Label)
+								}
+								fmt.Fprintf(&b, "Group: %d\n", ce.Group)
+								fmt.Fprintf(&b, "Start offset: %g   End offset: %g\n", ce.StartOffset, ce.EndOffset)
+							}
+						}
+					}
 					return b.String()
 				}
 				addNode(trNode, clbl, clbl, cdetail(), nil)
 			}
 		}
 	}
+
+	// ── Full decode branches: flpdiff / pyflp ───────────────────────
+	assetBuildFullBranches(func(parent *wui.TreeNode, text, title, detail string) *wui.TreeNode {
+		return addNode(parent, text, title, detail, nil)
+	}, p)
 
 	// ── Selection wiring ─────────────────────────────────────────────
 	var current nodeData
@@ -6221,6 +6783,380 @@ func openAssetTool(_ *wui.Window) {
 	})
 
 	showModal(w)
+}
+
+// ───────────────────────── Asset Viewer: full decode branches ─────────────────────────
+//
+// Two complete, independent trees: everything flpdiff decoded and everything
+// pyflp decoded. A reflection walker turns any Go value (structs, slices,
+// maps, pyflp's ordered maps ...) into tree nodes, so no field is left out.
+// Big lists are chunked and flat records of long lists are collapsed into one
+// node whose detail pane still shows every field.
+
+type assetAddFn func(parent *wui.TreeNode, text, title, detail string) *wui.TreeNode
+
+type assetKV struct {
+	key string
+	val reflect.Value
+}
+
+type assetCtx struct {
+	add       assetAddFn
+	count     int
+	limit     int
+	truncated bool
+}
+
+var assetOrderedMapType = reflect.TypeOf(pyflp.OrderedMap{})
+var assetTimeType = reflect.TypeOf(time.Time{})
+
+func assetShort(s string, n int) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " ")
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
+func assetDeref(rv reflect.Value) reflect.Value {
+	for rv.IsValid() && (rv.Kind() == reflect.Ptr || rv.Kind() == reflect.Interface) {
+		if rv.IsNil() {
+			return reflect.Value{}
+		}
+		rv = rv.Elem()
+	}
+	return rv
+}
+
+func assetIsBytes(rv reflect.Value) bool {
+	return (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && rv.Type().Elem().Kind() == reflect.Uint8
+}
+
+const assetMaxHexBytes = 256 * 1024
+
+func assetHex(b []byte) string {
+	if len(b) > assetMaxHexBytes {
+		return hex.EncodeToString(b[:assetMaxHexBytes]) + fmt.Sprintf("… (+%d more bytes)", len(b)-assetMaxHexBytes)
+	}
+	return hex.EncodeToString(b)
+}
+
+// assetScalar renders rv when it is a leaf value.
+func assetScalar(rv reflect.Value) (string, bool) {
+	if !rv.IsValid() {
+		return "<nil>", true
+	}
+	if assetIsBytes(rv) {
+		var b []byte
+		if rv.Kind() == reflect.Slice {
+			b = rv.Bytes()
+		} else {
+			b = make([]byte, rv.Len())
+			for i := range b {
+				b[i] = byte(rv.Index(i).Uint())
+			}
+		}
+		return fmt.Sprintf("<%d bytes> %s", len(b), assetHex(b)), true
+	}
+	switch rv.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.String:
+		if rv.CanInterface() {
+			return fmt.Sprint(rv.Interface()), true
+		}
+	case reflect.Struct:
+		if rv.Type() == assetTimeType && rv.CanInterface() {
+			return fmt.Sprint(rv.Interface()), true
+		}
+	}
+	return "", false
+}
+
+func assetKids(rv reflect.Value) (kids []assetKV, isList bool) {
+	switch rv.Kind() {
+	case reflect.Struct:
+		if rv.Type() == assetOrderedMapType {
+			om := rv.Interface().(pyflp.OrderedMap)
+			for _, k := range om.Keys {
+				kids = append(kids, assetKV{k, reflect.ValueOf(om.Vals[k])})
+			}
+			return
+		}
+		t := rv.Type()
+		for i := 0; i < rv.NumField(); i++ {
+			if t.Field(i).PkgPath != "" {
+				continue
+			}
+			kids = append(kids, assetKV{t.Field(i).Name, rv.Field(i)})
+		}
+	case reflect.Map:
+		keys := rv.MapKeys()
+		sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i].Interface()) < fmt.Sprint(keys[j].Interface()) })
+		for _, k := range keys {
+			kids = append(kids, assetKV{fmt.Sprint(k.Interface()), rv.MapIndex(k)})
+		}
+	case reflect.Slice, reflect.Array:
+		isList = true
+		for i := 0; i < rv.Len(); i++ {
+			kids = append(kids, assetKV{fmt.Sprintf("[%d]", i), rv.Index(i)})
+		}
+	}
+	return
+}
+
+func assetNameHint(kids []assetKV) string {
+	for _, k := range kids {
+		switch strings.ToLower(k.key) {
+		case "name", "displayname", "display_name", "label", "title":
+			if s, ok := assetScalar(assetDeref(k.val)); ok && s != "" && s != "<nil>" {
+				return " “" + assetShort(s, 60) + "”"
+			}
+		}
+	}
+	return ""
+}
+
+func assetIsFlat(kids []assetKV) bool {
+	for _, k := range kids {
+		if _, ok := assetScalar(assetDeref(k.val)); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func assetDetail(key string, kids []assetKV, isList bool) string {
+	var b strings.Builder
+	kind := "fields"
+	if isList {
+		kind = "items"
+	}
+	fmt.Fprintf(&b, "%s — %d %s\n\n", key, len(kids), kind)
+	for i, k := range kids {
+		if i >= 3000 {
+			fmt.Fprintf(&b, "… (%d more)\n", len(kids)-i)
+			break
+		}
+		v := assetDeref(k.val)
+		if s, ok := assetScalar(v); ok {
+			fmt.Fprintf(&b, "%s: %s\n", k.key, s)
+			continue
+		}
+		sub, subList := assetKids(v)
+		n := "fields"
+		if subList {
+			n = "items"
+		}
+		fmt.Fprintf(&b, "%s: (%d %s)\n", k.key, len(sub), n)
+	}
+	return b.String()
+}
+
+func assetFlatSummary(kids []assetKV) string {
+	parts := []string{}
+	for i, k := range kids {
+		if i >= 5 {
+			parts = append(parts, "…")
+			break
+		}
+		s, _ := assetScalar(assetDeref(k.val))
+		parts = append(parts, k.key+"="+assetShort(s, 28))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func (c *assetCtx) room(parent *wui.TreeNode) bool {
+	if c.count >= c.limit {
+		if !c.truncated {
+			c.truncated = true
+			c.add(parent, "… (node limit reached, remaining data omitted)", "Truncated", "The tree reached the node limit.")
+		}
+		return false
+	}
+	c.count++
+	return true
+}
+
+// walk adds rv (and its children) under parent.
+func (c *assetCtx) walk(parent *wui.TreeNode, key string, rv reflect.Value, collapseFlat bool, depth int) {
+	if !c.room(parent) {
+		return
+	}
+	rv = assetDeref(rv)
+	if s, ok := assetScalar(rv); ok {
+		c.add(parent, key+": "+assetShort(s, 120), key, key+": "+s)
+		return
+	}
+	kids, isList := assetKids(rv)
+	if len(kids) == 0 && !rv.IsValid() {
+		c.add(parent, key+": <nil>", key, key+": <nil>")
+		return
+	}
+	if depth > 60 {
+		c.add(parent, key+": <max depth>", key, "Maximum depth reached.")
+		return
+	}
+	if collapseFlat && assetIsFlat(kids) {
+		c.add(parent, key+"  "+assetFlatSummary(kids), key, assetDetail(key, kids, isList))
+		return
+	}
+	text := key + assetNameHint(kids)
+	if isList {
+		text += fmt.Sprintf("  [%d]", len(kids))
+	} else {
+		text += fmt.Sprintf("  {%d}", len(kids))
+	}
+	node := c.add(parent, text, key, assetDetail(key, kids, isList))
+	c.fill(node, kids, isList, depth)
+}
+
+// fill adds the children kids under node.
+func (c *assetCtx) fill(node *wui.TreeNode, kids []assetKV, isList bool, depth int) {
+	collapse := isList && len(kids) > 64
+	if isList && len(kids) > 200 {
+		for lo := 0; lo < len(kids); lo += 200 {
+			hi := lo + 200
+			if hi > len(kids) {
+				hi = len(kids)
+			}
+			chunk := c.add(node, fmt.Sprintf("[%d … %d]", lo, hi-1), "Items", fmt.Sprintf("Items %d to %d of %d", lo, hi-1, len(kids)))
+			for _, k := range kids[lo:hi] {
+				c.walk(chunk, k.key, k.val, collapse, depth+1)
+			}
+		}
+		return
+	}
+	for _, k := range kids {
+		c.walk(node, k.key, k.val, collapse, depth+1)
+	}
+}
+
+func assetSafe(c *assetCtx, parent *wui.TreeNode, label string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.add(parent, label+": error", label, fmt.Sprintf("%s failed: %v", label, r))
+		}
+	}()
+	fn()
+}
+
+// assetPyflpParse re-parses the in-memory project with pyflp.
+func assetPyflpParse(p *flp.FLPProject) (pp *pyflp.Project, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			pp, err = nil, fmt.Errorf("pyflp panic: %v", r)
+		}
+	}()
+	data, serr := flp.SerializeFLPProject(p)
+	if serr != nil {
+		if app.Path == "" {
+			return nil, serr
+		}
+		data, serr = os.ReadFile(app.Path)
+		if serr != nil {
+			return nil, serr
+		}
+	}
+	return pyflp.ParseBytes(data)
+}
+
+func assetPyEvent(c *assetCtx, parent *wui.TreeNode, idx int, e *pyflp.Event) {
+	if !c.room(parent) {
+		return
+	}
+	name := pyflp.IDName(e.ID())
+	typeName := ""
+	if t := e.Type(); t != nil {
+		typeName = t.Name
+	}
+	val := pyflp.EventValueJSON(e.Value(), true)
+	raw := e.Data()
+
+	var head strings.Builder
+	fmt.Fprintf(&head, "Event #%d\nID: %d (0x%02X)\nName: %s\nType: %s\nSize: %d bytes\n", idx, int(e.ID()), int(e.ID()), name, typeName, e.Size())
+	fmt.Fprintf(&head, "Payload (%d bytes): %s\n", len(raw), assetHex(raw))
+
+	rv := assetDeref(reflect.ValueOf(val))
+	if s, ok := assetScalar(rv); ok {
+		head.WriteString("\nDecoded value:\n" + s + "\n")
+		c.add(parent, fmt.Sprintf("[%d] %s = %s", idx, name, assetShort(s, 100)), name, head.String())
+		return
+	}
+	kids, isList := assetKids(rv)
+	if js, err := marshalIndentedJSON(val); err == nil {
+		head.WriteString("\nDecoded value (JSON):\n" + js + "\n")
+	}
+	if len(kids) == 0 {
+		c.add(parent, fmt.Sprintf("[%d] %s = <empty>", idx, name), name, head.String())
+		return
+	}
+	node := c.add(parent, fmt.Sprintf("[%d] %s%s", idx, name, assetNameHint(kids)), name, head.String())
+	c.fill(node, kids, isList, 1)
+}
+
+// assetBuildFullBranches adds the "flpdiff" and "pyflp" top-level branches.
+func assetBuildFullBranches(add assetAddFn, p *flp.FLPProject) {
+	c := &assetCtx{add: add, limit: 400000}
+
+	// ── flpdiff ──────────────────────────────────────────────────────
+	fd := add(nil, "flpdiff (full decode)", "flpdiff",
+		"Everything the flpdiff parser decoded from the project: the parsed model, the flp-info JSON view, the canonical text and the info text.")
+	assetSafe(c, fd, "Parsed model", func() {
+		c.walk(fd, "FLPProject (parsed model)", reflect.ValueOf(p), false, 0)
+	})
+	assetSafe(c, fd, "flp-info JSON model", func() {
+		c.walk(fd, "FlpInfoJson (info model)", reflect.ValueOf(flp.ToFlpInfoJson(p)), false, 0)
+	})
+	assetSafe(c, fd, "Canonical text", func() {
+		add(fd, "Canonical text", "Canonical text", flp.RenderCanonical(p))
+	})
+	assetSafe(c, fd, "Info text", func() {
+		add(fd, "Info text", "Info text", timestampsText(p, app.Path)+"\n\n"+flp.RenderInfo(p, app.Path))
+	})
+	assetSafe(c, fd, "Tempo / version", func() {
+		var b strings.Builder
+		if t := flp.GetTempo(p); t != nil {
+			fmt.Fprintf(&b, "Tempo: %.4f BPM\n", *t)
+		}
+		if v := flp.GetFLVersionBanner(p); v != nil {
+			fmt.Fprintf(&b, "FL version banner: %s\n", *v)
+		}
+		add(fd, "Tempo / version", "Tempo / version", b.String())
+	})
+
+	// ── pyflp ────────────────────────────────────────────────────────
+	py := add(nil, "pyflp (full decode)", "pyflp",
+		"Everything the pyflp parser decoded from the project: summary, the full decoded model (all properties, plugin states in hex) and every raw event.")
+	pp, err := assetPyflpParse(p)
+	if err != nil {
+		add(py, "pyflp parse error", "pyflp parse error", err.Error())
+		return
+	}
+	assetSafe(c, py, "Summary", func() {
+		add(py, "Summary", "Summary", strings.Join(pp.Summary(), "\n"))
+	})
+	assetSafe(c, py, "Decoded model", func() {
+		c.walk(py, "Project (decoded model)", reflect.ValueOf(pp.Dump(true)), false, 0)
+	})
+	assetSafe(c, py, "Raw events", func() {
+		evs := pp.AllEvents()
+		root := add(py, fmt.Sprintf("Raw events (%d)", len(evs)), "Raw events",
+			fmt.Sprintf("All %d events of the project in file order, decoded by pyflp.", len(evs)))
+		for lo := 0; lo < len(evs); lo += 200 {
+			hi := lo + 200
+			if hi > len(evs) {
+				hi = len(evs)
+			}
+			chunk := add(root, fmt.Sprintf("[%d … %d]", lo, hi-1), "Events", fmt.Sprintf("Events %d to %d of %d", lo, hi-1, len(evs)))
+			for i := lo; i < hi; i++ {
+				assetPyEvent(c, chunk, i, evs[i])
+			}
+		}
+	})
+	if info := duoInfoFor(p); info != nil {
+		add(py, "duo notes", "duo notes", duoProjectText(info, p))
+	}
 }
 
 // ───────────── synth GUI helpers ─────────────
