@@ -18,6 +18,7 @@ import (
 	"gitlab.com/gomidi/midi/v2"
 	"gitlab.com/gomidi/midi/v2/smf"
 	"github.com/gopxl/beep"
+	"github.com/gopxl/beep/wav" 
 	"github.com/gopxl/beep/speaker"
 )
 
@@ -33,6 +34,18 @@ func ensureSpeakerInit() {
 	speakerOnce.Do(func() {
 		speaker.Init(synthSR, synthSR.N(time.Second/30))
 	})
+}
+
+// globalSpeakerMu serializes every "swap what's playing" operation across
+// the whole app, so two code paths can never queue overlapping streams.
+var globalSpeakerMu sync.Mutex
+
+// swapSpeakerStream atomically replaces whatever is currently playing.
+func swapSpeakerStream(s beep.Streamer) {
+	globalSpeakerMu.Lock()
+	defer globalSpeakerMu.Unlock()
+	speaker.Clear()
+	speaker.Play(s)
 }
 
 // ───────────── wavetables ─────────────
@@ -81,57 +94,64 @@ func (w *wavetableSet) table(name string) []float64 {
 // It is passed by value and is safe to copy.
 type SynthOptions struct {
 	// ── Oscillators ──
-	Waveform1    string  // "sine" | "square" | "saw" | "triangle" | "noise"
-	Waveform2    string  // "off" | same values
-	Osc2Detune   float64 // semitones, -24..+24
-	Osc2Mix      float64 // 0..1
-	SubLevel     float64 // 0..1 (a sine one octave below osc1)
-	UnisonVoices int     // 1..7
-	UnisonDetune float64 // cents, 0..50
+	Waveform1    string
+	Waveform2    string
+	Osc2Detune   float64
+	Osc2Mix      float64
+	SubLevel     float64
+	UnisonVoices int
+	UnisonDetune float64
 
 	// ── Filter ──
-	FilterType     string  // "off" | "lp" | "hp" | "bp" | "notch"
-	FilterCutoff   float64 // Hz, 20..18000
-	FilterReso     float64 // Q, 0.5..20
-	FilterEnvAmt   float64 // octaves, -4..+4
-	FilterKeyTrack float64 // 0..1
+	FilterType     string
+	FilterCutoff   float64
+	FilterReso     float64
+	FilterEnvAmt   float64
+	FilterKeyTrack float64
 
 	// ── Filter envelope ──
-	FAttack  float64 // s
-	FDecay   float64 // s
-	FSustain float64 // 0..1
-	FRelease float64 // s
+	FAttack  float64
+	FDecay   float64
+	FSustain float64
+	FRelease float64
 
 	// ── Amp envelope ──
-	Attack  float64 // s
-	Decay   float64 // s
-	Sustain float64 // 0..1
-	Release float64 // s
+	Attack  float64
+	Decay   float64
+	Sustain float64
+	Release float64
 
 	// ── LFO ──
-	LFOShape  string  // "off" | "sine" | "tri" | "square" | "saw"
-	LFORate   float64 // Hz
-	LFODepth  float64 // 0..1
-	LFOTarget string  // "off" | "amp" | "filter"
-	LFOPitch  float64 // reserved for future pitch-mod (0 now)
+	LFOShape  string
+	LFORate   float64
+	LFODepth  float64
+	LFOTarget string
+	LFOPitch  float64
 
 	// ── Effects ──
-	Drive      float64 // 0..1 pre-filter saturation
-	DelayTime  float64 // s, 0..1
-	DelayFeed  float64 // 0..0.9
-	DelayMix   float64 // 0..1
-	ReverbSize float64 // 0..1
-	ReverbMix  float64 // 0..1
+	Drive      float64
+	DelayTime  float64
+	DelayFeed  float64
+	DelayMix   float64
+	ReverbSize float64
+	ReverbMix  float64
 
 	// ── Master ──
-	Gain      float64 // 0..1
-	VelToAmp  float64 // 0..1
-	VelToFilt float64 // 0..1
+	Gain      float64
+	VelToAmp  float64
+	VelToFilt float64
+
+	// ── Sample playback (one-shots) ──
+	SampleAttack  float64 // s, 0 = no fade-in (hard start)
+	SampleDecay   float64 // s, time to fall from 1.0 to SampleSustain
+	SampleSustain float64 // 0..1, level held during the middle of the sample
+	SampleRelease float64 // s, 0 = no fade-out (hard end at sample boundary)
+	SampleVolume  float64 // 0..1 (can exceed 1 for boost), global multiplier
+	SamplePitch   float64 // semitones, additional offset on top of note-key pitch
 }
 
 func defaultSynthOptions() SynthOptions {
 	return SynthOptions{
-		// ── Oscillators: clean sine ──
 		Waveform1:    "sine",
 		Waveform2:    "off",
 		Osc2Detune:   0,
@@ -140,34 +160,28 @@ func defaultSynthOptions() SynthOptions {
 		UnisonVoices: 1,
 		UnisonDetune: 0,
 
-		// ── Filter: fully open LP, no colouring ──
 		FilterType:     "lp",
-		FilterCutoff:   18000, // near-Nyquist, effectively bypassed
-		FilterReso:     0.707, // Butterworth — maximally flat
-		FilterEnvAmt:   0,     // no envelope movement
+		FilterCutoff:   18000,
+		FilterReso:     0.707,
+		FilterEnvAmt:   0,
 		FilterKeyTrack: 0,
 
-		// ── Filter envelope: neutral ──
 		FAttack:  0.004,
 		FDecay:   0.30,
 		FSustain: 1.0,
 		FRelease: 0.20,
 
-		// ── Amp envelope: soft attack, natural decay, full sustain,
-		//    gentle release — a clean "pure tone" feel ──
 		Attack:  0.008,
 		Decay:   0.20,
 		Sustain: 0.85,
 		Release: 0.35,
 
-		// ── LFO: off ──
 		LFOShape:  "off",
 		LFORate:   5,
 		LFODepth:  0,
 		LFOTarget: "off",
 		LFOPitch:  0,
 
-		// ── Effects: no drive, no delay, no reverb ──
 		Drive:      0,
 		DelayTime:  0.25,
 		DelayFeed:  0,
@@ -175,10 +189,17 @@ func defaultSynthOptions() SynthOptions {
 		ReverbSize: 0,
 		ReverbMix:  0,
 
-		// ── Master: conservative gain, no velocity colouring ──
 		Gain:      0.6,
-		VelToAmp:  0.7, // still responds to velocity but doesn't over-modulate
-		VelToFilt: 0,   // filter is fixed
+		VelToAmp:  0.7,
+		VelToFilt: 0,
+
+		// ── Sample defaults: subtle fades, full sustain, no pitch offset ──
+		SampleAttack:  0.001,
+		SampleDecay:   0.0,
+		SampleSustain: 1.0,
+		SampleRelease: 0.005,
+		SampleVolume:  1.0,
+		SamplePitch:   0.0,
 	}
 }
 
@@ -211,12 +232,357 @@ func midiKeyToHz(key int) float64 {
 	return 440.0 * math.Pow(2.0, float64(key-69)/12.0)
 }
 
-// ───────────── pattern → PCM ─────────────
+// ───────────── sample locator / loader / cache ─────────────
 
-// renderPattern renders a pattern with the full synth engine: multi-osc voices
-// with unison and sub, per-voice biquad filter with a dedicated envelope,
-// optional LFO modulation, and post effects (drive, delay, reverb).
-func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []float64 {
+// sampleCache holds decoded mono PCM arrays keyed by absolute file path.
+// Populated on demand; never evicted (fine for a preview tool).
+type sampleCache struct {
+	mu      sync.RWMutex
+	samples map[string][]float64
+}
+
+var globalSampleCache = &sampleCache{samples: make(map[string][]float64)}
+
+func (c *sampleCache) get(path string) ([]float64, bool) {
+	c.mu.RLock()
+	s, ok := c.samples[path]
+	c.mu.RUnlock()
+	return s, ok
+}
+
+func (c *sampleCache) put(path string, s []float64) {
+	c.mu.Lock()
+	c.samples[path] = s
+	c.mu.Unlock()
+}
+
+// loadSampleCached returns the mono float64 PCM for path, decoding once and
+// caching the result. Returns nil if the file can't be decoded.
+func loadSampleCached(path string) []float64 {
+	if s, ok := globalSampleCache.get(path); ok {
+		return s
+	}
+	s := loadSamplePCM(path)
+	if s != nil {
+		globalSampleCache.put(path, s)
+	}
+	return s
+}
+
+// loadSamplePCM decodes a WAV file to a mono []float64 at synthSR.
+// Add cases to `switch ext` for mp3/ogg/flac (one import + one case each).
+func loadSamplePCM(path string) []float64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	ext := strings.ToLower(filepath.Ext(path))
+	var streamer beep.StreamSeekCloser
+	var format beep.Format
+	switch ext {
+	case ".wav":
+		streamer, format, err = wav.Decode(f)
+	default:
+		return nil
+	}
+	if err != nil || streamer == nil {
+		return nil
+	}
+	defer streamer.Close()
+
+	// Decode to mono.
+	buf := make([][2]float64, 4096)
+	out := make([]float64, 0, streamer.Len())
+	for {
+		n, ok := streamer.Stream(buf)
+		if n > 0 {
+			for i := 0; i < n; i++ {
+				out = append(out, (buf[i][0]+buf[i][1])*0.5)
+			}
+		}
+		if !ok {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+
+	// Resample to synthSR if needed (linear interpolation).
+	if format.SampleRate != synthSR {
+		ratio := float64(format.SampleRate) / float64(synthSR)
+		newLen := int(float64(len(out)) / ratio)
+		resampled := make([]float64, newLen)
+		for i := 0; i < newLen; i++ {
+			srcPos := float64(i) * ratio
+			i0 := int(srcPos)
+			if i0 >= len(out)-1 {
+				break
+			}
+			frac := srcPos - float64(i0)
+			resampled[i] = out[i0]*(1-frac) + out[i0+1]*frac
+		}
+		out = resampled
+	}
+	return out
+}
+
+// resolveSamplePath implements the 3-step lookup chain:
+//
+//	A) <flp dir>/<basename>
+//	B) <flp dir>/Samples/<basename>, <flp dir>/Data/<basename>, and the
+//	   relative path as stored (handles "Samples\kick.wav")
+//	C) the absolute path as given, after expanding FL tokens
+//
+// Returns "" if none exist.
+func resolveSamplePath(flpPath, samplePath string) string {
+	if samplePath == "" {
+		return ""
+	}
+	flpDir := filepath.Dir(flpPath)
+
+	// Normalize separators from the FLP (Windows-style backslashes).
+	normalized := strings.ReplaceAll(samplePath, "\\", "/")
+	base := filepath.Base(normalized)
+
+	candidates := make([]string, 0, 6)
+
+	// A) FLP root, filename only
+	candidates = append(candidates, filepath.Join(flpDir, base))
+
+	// B) Common subfolders + the relative path itself
+	candidates = append(candidates, filepath.Join(flpDir, "Samples", base))
+	candidates = append(candidates, filepath.Join(flpDir, "Data", base))
+	candidates = append(candidates, filepath.Join(flpDir, "Packs", base))
+	if normalized != base {
+		candidates = append(candidates, filepath.Join(flpDir, filepath.FromSlash(normalized)))
+	}
+
+	// C) Absolute path as-is (or FL-token-expanded)
+	if filepath.IsAbs(normalized) {
+		candidates = append(candidates, filepath.FromSlash(normalized))
+	}
+	if strings.HasPrefix(samplePath, "%") {
+		if expanded := expandFlToken(samplePath); expanded != "" {
+			candidates = append(candidates, expanded)
+		}
+	}
+
+	// D) User-data root (from persistent config)
+	if appConfig.FLStudioUserData != "" {
+		candidates = append(candidates,
+			filepath.Join(appConfig.FLStudioUserData, base))
+		if normalized != base {
+			candidates = append(candidates,
+				filepath.Join(appConfig.FLStudioUserData, filepath.FromSlash(normalized)))
+		}
+	}
+
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+// expandFlToken handles %FLStudioFactoryData% by scanning the standard
+// Image-Line install root for any FL Studio * folder. Windows-only.
+func expandFlToken(p string) string {
+	// %FLStudioUserData% — from the persistent config.
+	const userTok = "%FLStudioUserData%"
+	if strings.HasPrefix(p, userTok) {
+		if appConfig.FLStudioUserData == "" {
+			return ""
+		}
+		tail := strings.TrimLeft(p[len(userTok):], "/\\")
+		candidate := filepath.Join(appConfig.FLStudioUserData, filepath.FromSlash(tail))
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		return ""
+	}
+
+	// %FLStudioFactoryData% — scan the standard Image-Line install root.
+	const factoryTok = "%FLStudioFactoryData%"
+	if strings.HasPrefix(p, factoryTok) {
+		tail := strings.TrimLeft(p[len(factoryTok):], "/\\")
+		root := `C:\Program Files\Image-Line`
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return ""
+		}
+		for _, e := range entries {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), "FL Studio") {
+				continue
+			}
+			candidate := filepath.Join(root, e.Name(), "Data", "Patches", filepath.FromSlash(tail))
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+
+	return ""
+}
+
+// isSampleChannel reports whether a channel should be routed to sample
+// playback rather than the synth engine.
+func isSampleChannel(ch flp.Channel) bool {
+	return ch.Kind == flp.ChannelSampler &&
+		ch.SamplePath != nil && *ch.SamplePath != ""
+}
+
+// mixSample mixes a one-shot sample into buf at the note's tick position.
+// The sample is resampled to (note key + SamplePitch) semitones above C5.
+// The envelope is a standard ADSR: Attack ramps 0→1, Decay ramps 1→Sustain,
+// Sustain holds until Release begins, Release ramps Sustain→0 and finishes
+// exactly at the sample's natural end.
+//
+// Key guarantees:
+//   - SampleAttack  == 0  → instant start (no fade-in)
+//   - SampleRelease == 0  → no fade-out; the sample plays to its natural end
+//     and cuts hard (which is often what you want for percussive hits)
+//   - SampleRelease > sample length → the whole sample is a fade-out from
+//     the sustain level down to 0
+func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64, opt SynthOptions) {
+	if len(sample) < 2 {
+		return
+	}
+	startSample := int(float64(n.Position) * spt * sr)
+	if startSample >= len(buf) {
+		return
+	}
+
+	vel := float64(n.Velocity) / 127.0
+	if vel <= 0 {
+		vel = 1
+	}
+	vol := opt.SampleVolume
+	if vol < 0 {
+		vol = 0
+	}
+	if vol > 4 {
+		vol = 4
+	}
+
+	// Pitch ratio: note key relative to C5 (MIDI 60) plus user semitone offset.
+	pitchRatio := math.Pow(2.0, (float64(n.Key-60)+opt.SamplePitch)/12.0)
+	if pitchRatio <= 0 {
+		return
+	}
+
+	sampleLen := len(sample)
+	maxOut := int(float64(sampleLen) / pitchRatio)
+	if startSample+maxOut > len(buf) {
+		maxOut = len(buf) - startSample
+	}
+	if maxOut <= 0 {
+		return
+	}
+
+	// ── Envelope parameters, clamped to the actual output length ──
+	attackSamples := int(opt.SampleAttack * sr)
+	decaySamples := int(opt.SampleDecay * sr)
+	releaseSamples := int(opt.SampleRelease * sr)
+
+	if attackSamples < 0 {
+		attackSamples = 0
+	}
+	if decaySamples < 0 {
+		decaySamples = 0
+	}
+	if releaseSamples < 0 {
+		releaseSamples = 0
+	}
+	if attackSamples > maxOut {
+		attackSamples = maxOut
+	}
+	if decaySamples > maxOut-attackSamples {
+		decaySamples = maxOut - attackSamples
+	}
+	if releaseSamples > maxOut {
+		releaseSamples = maxOut
+	}
+
+	sustain := opt.SampleSustain
+	if sustain < 0 {
+		sustain = 0
+	}
+	if sustain > 1 {
+		sustain = 1
+	}
+
+	attackEnd := attackSamples
+	decayEnd := attackEnd + decaySamples
+	// Release begins so the fade completes exactly at the sample end.
+	releaseStart := maxOut - releaseSamples
+	if releaseStart < 0 {
+		releaseStart = 0
+	}
+	if releaseStart < decayEnd {
+		releaseStart = decayEnd
+	}
+
+	for out := 0; out < maxOut; out++ {
+		srcPos := float64(out) * pitchRatio
+		i0 := int(srcPos)
+		if i0 >= sampleLen-1 {
+			break
+		}
+		frac := srcPos - float64(i0)
+		s := sample[i0]*(1-frac) + sample[i0+1]*frac
+
+		// Envelope: minimum of attack ramp, decay curve and release ramp.
+		env := 1.0
+
+		// Attack
+		if attackSamples > 0 && out < attackEnd {
+			a := float64(out) / float64(attackSamples)
+			if a < env {
+				env = a
+			}
+		}
+
+		// Decay to sustain
+		if out >= attackEnd {
+			var d float64
+			if decaySamples > 0 && out < decayEnd {
+				t := float64(out-attackEnd) / float64(decaySamples)
+				d = 1.0 - (1.0-sustain)*t
+			} else {
+				d = sustain
+			}
+			if d < env {
+				env = d
+			}
+		}
+
+		// Release (only when releaseSamples > 0; release==0 means hard cut)
+		if releaseSamples > 0 && out >= releaseStart {
+			t := float64(out-releaseStart) / float64(releaseSamples)
+			if t > 1 {
+				t = 1
+			}
+			r := sustain * (1.0 - t)
+			if r < env {
+				env = r
+			}
+		}
+
+		buf[startSample+out] += s * env * vel * vol
+	}
+}
+
+// renderPattern renders a pattern to PCM. Channels whose kind is "sampler"
+// and whose sample path resolves to a readable file are rendered with sample
+// playback (one-shot, pitch-shifted by note key). All other notes go through
+// the synth engine.
+func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
+	channels []flp.Channel, flpPath string) []float64 {
+
 	if ppq <= 0 {
 		ppq = 96
 	}
@@ -226,6 +592,27 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 	tps := bpm / 60.0 * float64(ppq)
 	spt := 1.0 / tps
 	sr := float64(synthSR)
+
+	// Channel lookup + per-channel sample pre-resolution (once).
+	chByIid := make(map[int]flp.Channel, len(channels))
+	for _, ch := range channels {
+		chByIid[ch.Iid] = ch
+	}
+	chanSamples := make(map[int][]float64)
+	haveSamples := false
+	if flpPath != "" {
+		for iid, ch := range chByIid {
+			if !isSampleChannel(ch) {
+				continue
+			}
+			if resolved := resolveSamplePath(flpPath, *ch.SamplePath); resolved != "" {
+				if smp := loadSampleCached(resolved); len(smp) > 0 {
+					chanSamples[iid] = smp
+					haveSamples = true
+				}
+			}
+		}
+	}
 
 	// Buffer length: last note end + longest release + effects tail.
 	var maxTick uint32
@@ -244,6 +631,9 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 	}
 	if opt.ReverbMix > 0.01 {
 		tail += 2.0
+	}
+	if haveSamples {
+		tail += 2.0 // one-shots can run past their note
 	}
 	totalSec := float64(maxTick)*spt + tail + 0.1
 	if totalSec < 0.2 {
@@ -265,7 +655,6 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 	}
 	subTable := wavetables.sine
 
-	// Unison prep.
 	unisonVoices := opt.UnisonVoices
 	if unisonVoices < 1 {
 		unisonVoices = 1
@@ -279,12 +668,10 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 	}
 	osc1Mix := 1.0 - opt.Osc2Mix
 
-	// LFO active?
 	lfoActive := (opt.LFOShape == "sine" || opt.LFOShape == "tri" ||
 		opt.LFOShape == "square" || opt.LFOShape == "saw") &&
 		(opt.LFOTarget == "amp" || opt.LFOTarget == "filter")
 
-	// ── Voice renderer (closure captures everything above) ──
 	renderVoice := func(n flp.Note) {
 		if n.Length == 0 {
 			return
@@ -299,7 +686,6 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 			noteEnd = len(buf)
 		}
 
-		// Release window
 		relSec := opt.Release
 		if filterActive && opt.FRelease > relSec {
 			relSec = opt.FRelease
@@ -310,27 +696,23 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 			releaseEnd = len(buf)
 		}
 
-		// Envelopes
 		ampEnv := newADSR(opt.Attack, opt.Decay, opt.Sustain, opt.Release, sr)
 		var filtEnv *adsr
 		if filterActive {
 			filtEnv = newADSR(opt.FAttack, opt.FDecay, opt.FSustain, opt.FRelease, sr)
 		}
 
-		// Velocity
 		vel := float64(n.Velocity) / 127.0
 		if vel <= 0 {
 			vel = 1
 		}
 		velAmp := (1 - opt.VelToAmp) + opt.VelToAmp*vel
-		velFilt := 1.0 + opt.VelToFilt*(vel-0.5)*2 // 0..2
+		velFilt := 1.0 + opt.VelToFilt*(vel-0.5)*2
 
-		// Frequencies
 		baseHz := midiKeyToHz(n.Key)
 		subIncr := baseHz * 0.5 * float64(wavetableSize) / sr
 		osc2Incr := baseHz * math.Pow(2, opt.Osc2Detune/12.0) * float64(wavetableSize) / sr
 
-		// Unison phase / increment arrays
 		unisonPhases := make([]float64, unisonVoices)
 		unisonIncrs := make([]float64, unisonVoices)
 		for u := 0; u < unisonVoices; u++ {
@@ -343,16 +725,10 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 		}
 
 		var subPhase, osc2Phase float64
-
-		// Per-voice filter and state
 		var filt biquad
 		filtCountdown := 0
-
-		// LFO
 		lfoIncr := opt.LFORate / sr
 		lfoPhase := 0.0
-
-		// Per-voice RNG (deterministic noise)
 		noiseState := uint32(n.Position)*2654435761 + uint32(n.Key)*40503 + 1
 
 		for i := startSample; i < releaseEnd; i++ {
@@ -372,7 +748,6 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 				break
 			}
 
-			// ── Oscillators ──
 			var osc float64
 			if table1 != nil {
 				var sum float64
@@ -386,7 +761,7 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 				}
 				osc = sum * unisonAmp
 			} else {
-			noiseState = noiseState*1664525 + 1013904223
+				noiseState = noiseState*1664525 + 1013904223
 				osc = float64(int32(noiseState)) / float64(1<<31)
 			}
 
@@ -413,10 +788,8 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 				}
 			}
 
-			// ── Amp envelope ──
 			osc *= ampVal * velAmp
 
-			// ── LFO ──
 			var lfoVal float64
 			if lfoActive {
 				switch opt.LFOShape {
@@ -446,7 +819,6 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 				}
 			}
 
-			// ── Filter ──
 			if filterActive {
 				if filtCountdown <= 0 {
 					fc := opt.FilterCutoff
@@ -472,7 +844,13 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions) []fl
 		}
 	}
 
+	// Route each note: sample playback if channel is a sampler with a
+	// resolvable file, otherwise synth.
 	for _, n := range pat.Notes {
+		if smp, ok := chanSamples[n.ChannelIid]; ok {
+			mixSample(buf, smp, n, spt, sr, opt)
+			continue
+		}
 		renderVoice(n)
 	}
 
@@ -525,7 +903,7 @@ func previewBuf(cfg SynthOptions, durationSec float64) []float64 {
 			{Position: 48, Length: 96, Key: 67, Velocity: 110, ChannelIid: 0},
 		},
 	}
-	buf := renderPattern(pat, 96, 120, cfg)
+	buf := renderPattern(pat, 96, 120, cfg, nil, "")
 	n := int(durationSec * float64(synthSR))
 	if n > 0 && len(buf) > n {
 		buf = buf[:n]
@@ -869,6 +1247,7 @@ func (s *positionStreamer) SeekTo(pos int) {
 
 type MIDIPlayer struct {
 	mu         sync.Mutex
+	playMu     sync.Mutex
 	stream     *positionStreamer
 	playing    bool
 	reachedEnd bool
@@ -879,14 +1258,21 @@ type MIDIPlayer struct {
 func NewMIDIPlayer() *MIDIPlayer { return &MIDIPlayer{} }
 
 // PlayPattern renders pat and starts playing it through the speaker.
-// Any currently playing pattern is stopped first.
-func (p *MIDIPlayer) PlayPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions, startTick uint32) {
+// `channels` and `flpPath` let the synth route sampler-kind channels to
+// sample playback; pass nil / "" to disable.
+func (p *MIDIPlayer) PlayPattern(pat flp.Pattern, ppq int, bpm float64,
+	opt SynthOptions, startTick uint32, channels []flp.Channel, flpPath string) {
+
+	// Serialize concurrent PlayPattern calls (e.g. two rapid button presses
+	// while the previous render is still ongoing).
+	p.playMu.Lock()
+	defer p.playMu.Unlock()
+
 	ensureSpeakerInit()
 
-	buf := renderPattern(pat, ppq, bpm, opt)
+	buf := renderPattern(pat, ppq, bpm, opt, channels, flpPath)
 	stream := &positionStreamer{buf: buf}
 
-	// Seek to the requested start tick (or clamp to 0 if past the end).
 	if bpm > 0 && ppq > 0 {
 		tps := bpm / 60.0 * float64(ppq)
 		if tps > 0 {
@@ -916,8 +1302,7 @@ func (p *MIDIPlayer) PlayPattern(pat flp.Pattern, ppq int, bpm float64, opt Synt
 	p.bpm = bpm
 	p.mu.Unlock()
 
-	speaker.Clear()
-	speaker.Play(stream)
+	swapSpeakerStream(stream)
 }
 
 func (p *MIDIPlayer) Stop() {
@@ -927,7 +1312,9 @@ func (p *MIDIPlayer) Stop() {
 	p.stream = nil
 	p.mu.Unlock()
 	if playing {
+		globalSpeakerMu.Lock()
 		speaker.Clear()
+		globalSpeakerMu.Unlock()
 	}
 }
 
@@ -1064,6 +1451,86 @@ type AppState struct {
 var app AppState
 
 var globalSynth = NewSynthConfig()
+
+// ───────────── persistent app config ─────────────
+
+// AppConfig is stored as <exe-basename>.json next to the executable.
+// Version tracks schema changes so future migrations can be applied.
+type AppConfig struct {
+	Version          int           `json:"version"`
+	FLStudioUserData string        `json:"fl_studio_user_data"`
+	Synth            *SynthOptions `json:"synth,omitempty"`
+}
+
+const appConfigVersion = 3
+
+var appConfig AppConfig
+
+// configFilePath returns <exe-dir>/<exe-basename>.json
+func configFilePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "flp-tool.json"
+	}
+	base := strings.TrimSuffix(filepath.Base(exe), filepath.Ext(exe))
+	return filepath.Join(filepath.Dir(exe), base+".json")
+}
+
+// loadAppConfig reads the config file, or creates one with sensible defaults,
+// then applies the persisted SynthOptions to globalSynth.
+//
+// We pre-populate appConfig with defaults before unmarshalling. Because Go's
+// encoding/json only overwrites fields that are present in the JSON payload,
+// this automatically migrates configs written by older versions that are
+// missing newly-added fields (like SampleSustain).
+func loadAppConfig() {
+	// Defaults first.
+	if home, herr := os.UserHomeDir(); herr == nil {
+		appConfig.FLStudioUserData = filepath.Join(home,
+			"Documents", "Image-Line", "FL Studio")
+	}
+	def := defaultSynthOptions()
+	appConfig.Synth = &def
+	appConfig.Version = appConfigVersion
+
+	p := configFilePath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		// First run — write the default config.
+		saveAppConfig()
+	} else {
+		_ = json.Unmarshal(data, &appConfig)
+		// Guard against a nil Synth in a malformed file.
+		if appConfig.Synth == nil {
+			d := defaultSynthOptions()
+			appConfig.Synth = &d
+		}
+		appConfig.Version = appConfigVersion
+	}
+
+	// Apply persisted synth parameters to the live config.
+	restored := *appConfig.Synth
+	globalSynth.Update(func(o *SynthOptions) { *o = restored })
+}
+
+// saveAppConfig writes the config file. Errors are silently ignored —
+// config is a convenience, not critical.
+func saveAppConfig() {
+	appConfig.Version = appConfigVersion
+	data, err := json.MarshalIndent(appConfig, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(configFilePath(), data, 0o644)
+}
+
+// persistSynth snapshots the live synth parameters into the config and
+// writes the file. Called when the Synth Settings modal closes.
+func persistSynth() {
+	snapshot := globalSynth.Snapshot()
+	appConfig.Synth = &snapshot
+	saveAppConfig()
+}
 
 // ───────────────────────── text & ui helpers ─────────────────────────
 
@@ -1376,6 +1843,8 @@ func trimForUI(s string) string {
 // ───────────────────────── main window ─────────────────────────
 
 func main() {
+	loadAppConfig()
+	
 	// CLI: flp-gui <path.flp>  → preload that project.
 	if len(os.Args) > 1 {
 		path := os.Args[1]
@@ -2646,7 +3115,7 @@ func openVisualizerTool(_ *wui.Window) {
 		if ppq <= 0 {
 			ppq = 96
 		}
-		s.player.PlayPattern(pat, ppq, bpm, s.synth.Snapshot(), s.manualTick)
+		s.player.PlayPattern(pat, ppq, bpm, s.synth.Snapshot(), s.manualTick, s.project.Channels, s.source)
 		btnPlay.SetText("Stop")
 		s.playTimer.Start()
 	})
@@ -3739,9 +4208,29 @@ func openChannelTool(_ *wui.Window) {
 					if c.Name != nil && *c.Name != "" {
 						fmt.Fprintf(&b, "Name: %s\n", *c.Name)
 					}
+
+					// ── Sample resolution ──
 					if c.SamplePath != nil && *c.SamplePath != "" {
-						fmt.Fprintf(&b, "Sample: %s\n", *c.SamplePath)
+						raw := *c.SamplePath
+						fmt.Fprintf(&b, "\nSample (raw): %s\n", raw)
+						if app.Path != "" {
+							if resolved := resolveSamplePath(app.Path, raw); resolved != "" {
+								fmt.Fprintf(&b, "Resolved:    %s\n", resolved)
+								if st, err := os.Stat(resolved); err == nil {
+									fmt.Fprintf(&b, "Status:      found (%s)\n", formatBytes(st.Size()))
+								}
+								if pcm := loadSampleCached(resolved); len(pcm) > 0 {
+									dur := float64(len(pcm)) / float64(synthSR)
+									fmt.Fprintf(&b, "Duration:    %.3f s\n", dur)
+									fmt.Fprintf(&b, "PCM samples: %d\n", len(pcm))
+								}
+							} else {
+								fmt.Fprintf(&b, "Resolved:    (not found)\n")
+								fmt.Fprintf(&b, "Status:      missing — checked FLP root, Samples/, Data/, Packs/, and absolute path\n")
+							}
+						}
 					}
+
 					if c.Plugin != nil {
 						fmt.Fprintf(&b, "Plugin: %s\n", c.Plugin.InternalName)
 						if c.Plugin.Name != nil && *c.Plugin.Name != "" {
@@ -4511,6 +5000,10 @@ func addSynthCombo(parent ctrlAdder, x, y, labelW, editW int, label string,
 func openSynthSettingsTool(_ *wui.Window) {
 	w := newModal("Synthesizer")
 
+	// Persist the live synth to the config whenever the modal closes, no
+	// matter how it was closed (Close button, X, Alt+F4, Esc, ...).
+	w.SetOnClose(persistSynth)
+
 	initial := globalSynth.Snapshot()
 
 	// ── Preview cache (invalidated on any change) ──
@@ -4529,7 +5022,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 		return previewBufCache
 	}
 
-	// ── Preview paint box (declared up front so sync() can call Paint) ──
+	// ── Preview paint box ──
 	prevPb := wui.NewPaintBox()
 	w.Add(prevPb)
 	prevPb.SetOnPaint(func(c *wui.Canvas) {
@@ -4606,6 +5099,9 @@ func openSynthSettingsTool(_ *wui.Window) {
 		revSize, revMix          *wui.FloatUpDown
 
 		gain, velAmp, velFilt *wui.FloatUpDown
+
+		sampleAttack, sampleDecay, sampleSustain *wui.FloatUpDown
+		sampleRelease, sampleVolume, samplePitch *wui.FloatUpDown
 	}
 	var ws widgetSet
 
@@ -4650,6 +5146,14 @@ func openSynthSettingsTool(_ *wui.Window) {
 			o.Gain = ws.gain.Value()
 			o.VelToAmp = ws.velAmp.Value()
 			o.VelToFilt = ws.velFilt.Value()
+
+			// Sample
+			o.SampleAttack = ws.sampleAttack.Value()
+			o.SampleDecay = ws.sampleDecay.Value()
+			o.SampleSustain = ws.sampleSustain.Value()
+			o.SampleRelease = ws.sampleRelease.Value()
+			o.SampleVolume = ws.sampleVolume.Value()
+			o.SamplePitch = ws.samplePitch.Value()
 		})
 		previewValid = false
 		prevPb.Paint()
@@ -4663,9 +5167,10 @@ func openSynthSettingsTool(_ *wui.Window) {
 	tabs.AddTab("Envelopes")
 	tabs.AddTab("LFO")
 	tabs.AddTab("FX")
+	tabs.AddTab("Sample")
 
 	var panels []*wui.Panel
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 6; i++ {
 		p := wui.NewPanel()
 		p.SetVisible(i == 0)
 		w.Add(p)
@@ -4712,7 +5217,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 			0, 1, 3, initial.FilterKeyTrack, func(float64) { sync() })
 	}
 
-	// ── Envelopes panel (stacked: Amp first, then Filter below) ──
+	// ── Envelopes panel ──
 	{
 		p := panels[2]
 
@@ -4747,7 +5252,7 @@ func openSynthSettingsTool(_ *wui.Window) {
 			0, 12, 2, initial.LFOPitch, func(float64) { sync() })
 	}
 
-	// ── FX panel (compressed for the standard modal width) ──
+	// ── FX panel ──
 	{
 		p := panels[4]
 
@@ -4770,6 +5275,64 @@ func openSynthSettingsTool(_ *wui.Window) {
 			0, 1, 3, initial.ReverbMix, func(float64) { sync() })
 	}
 
+	// ── Sample panel ──
+	{
+		p := panels[5]
+
+		// ── Envelope (left) ──
+		addSynthHeader(p, 20, 10, 220, "Sample envelope")
+		ws.sampleAttack = addSynthFloat(p, 20, 40, 80, 100, "Attack (s)",
+			0, 0.5, 4, initial.SampleAttack, func(float64) { sync() })
+		ws.sampleDecay = addSynthFloat(p, 20, 76, 80, 100, "Decay (s)",
+			0, 0.5, 4, initial.SampleDecay, func(float64) { sync() })
+		ws.sampleSustain = addSynthFloat(p, 20, 112, 80, 100, "Sustain",
+			0, 1, 3, initial.SampleSustain, func(float64) { sync() })
+		ws.sampleRelease = addSynthFloat(p, 20, 148, 80, 100, "Release (s)",
+			0, 0.5, 4, initial.SampleRelease, func(float64) { sync() })
+
+		// ── Output (middle) ──
+		addSynthHeader(p, 220, 10, 130, "Sample output")
+		ws.sampleVolume = addSynthFloat(p, 220, 40, 60, 80, "Volume",
+			0, 2, 3, initial.SampleVolume, func(float64) { sync() })
+		ws.samplePitch = addSynthFloat(p, 220, 76, 60, 80, "Pitch (st)",
+			-24, 24, 2, initial.SamplePitch, func(float64) { sync() })
+
+		// ── FL Studio user data (right) ──
+		addSynthHeader(p, 360, 10, 280, "FL Studio user data")
+		userLbl := newLabel("Path:", 360, 44, 40, labelH)
+		p.Add(userLbl)
+
+		userEdit := wui.NewEditLine()
+		userEdit.SetBounds(400, 40, 220, editH)
+		userEdit.SetText(appConfig.FLStudioUserData)
+		userEdit.SetOnTextChange(func() {
+			appConfig.FLStudioUserData = userEdit.Text()
+			saveAppConfig()
+		})
+		if fontNormal != nil {
+			userEdit.SetFont(fontNormal)
+		}
+		p.Add(userEdit)
+
+		userBrowse := newBtn("Browse...", 360, 76, 100, editH, func() {
+			dlg := wui.NewFolderSelectDialog()
+			dlg.SetTitle("Select FL Studio user data folder")
+			if ok, path := dlg.Execute(w); ok && path != "" {
+				appConfig.FLStudioUserData = path
+				userEdit.SetText(path)
+				saveAppConfig()
+			}
+		})
+		p.Add(userBrowse)
+
+		userInfo := newLabel(
+			"Used to resolve %FLStudioUserData% paths and\n"+
+				"as a fallback root for relative samples.\n"+
+				"Saved next to the executable.",
+			360, 116, 260, 70)
+		p.Add(userInfo)
+	}
+	
 	// ── Master row ──
 	masterLbl := newLabel("Master", 0, 0, 60, labelH)
 	if fontBold != nil {
@@ -4816,16 +5379,17 @@ func openSynthSettingsTool(_ *wui.Window) {
 	w.Add(btnPreview)
 	btnReset := newBtn("Reset", 0, 0, 90, btnH, nil)
 	w.Add(btnReset)
-	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() {
+		persistSynth()
+		w.Close()
+	})
 	w.Add(btnClose)
 
 	btnPreview.SetOnClick(func() {
 		ensureSpeakerInit()
 		cfg := globalSynth.Snapshot()
 		buf := previewBuf(cfg, 1.2)
-		stream := &positionStreamer{buf: buf}
-		speaker.Clear()
-		speaker.Play(stream)
+		swapSpeakerStream(&positionStreamer{buf: buf})
 	})
 
 	btnReset.SetOnClick(func() {
@@ -4872,10 +5436,18 @@ func openSynthSettingsTool(_ *wui.Window) {
 		ws.velAmp.SetValue(def.VelToAmp)
 		ws.velFilt.SetValue(def.VelToFilt)
 
+		// Sample
+		ws.sampleAttack.SetValue(def.SampleAttack)
+		ws.sampleDecay.SetValue(def.SampleDecay)
+		ws.sampleSustain.SetValue(def.SampleSustain)
+		ws.sampleRelease.SetValue(def.SampleRelease)
+		ws.sampleVolume.SetValue(def.SampleVolume)
+		ws.samplePitch.SetValue(def.SamplePitch)
+
 		previewValid = false
 		prevPb.Paint()
 	})
-
+	
 	// ── Tab switching ──
 	tabs.SetOnChange(func(idx int) {
 		for i, p := range panels {
@@ -4896,7 +5468,6 @@ func openSynthSettingsTool(_ *wui.Window) {
 			p.SetBounds(cx+2, cy+2, cw-4, chh-4)
 		}
 
-		// ── Master row ──
 		masterY := tabY + tabH + 10
 		masterLbl.SetBounds(margin, masterY+4, 60, labelH)
 
@@ -4909,7 +5480,6 @@ func openSynthSettingsTool(_ *wui.Window) {
 		velFiltLbl.SetBounds(margin+370, masterY+4, 80, labelH)
 		ws.velFilt.SetBounds(margin+450, masterY, 80, editH)
 
-		// ── Preview ──
 		prevY := masterY + editH + 10
 		prevLbl.SetBounds(margin, prevY+2, 200, labelH)
 		prevY += labelH + 4
@@ -4921,7 +5491,6 @@ func openSynthSettingsTool(_ *wui.Window) {
 		}
 		prevPb.SetBounds(margin, prevY, iw-2*margin, prevH)
 
-		// ── Buttons ──
 		btnPreview.SetBounds(margin, barY, 130, btnH)
 		btnReset.SetBounds(margin+140, barY, 90, btnH)
 		btnClose.SetBounds(iw-margin-closeBtnW, barY, closeBtnW, btnH)
