@@ -19,7 +19,7 @@ import (
 	"strings"
 
 	"github.com/2dprototype/flp"
-	"github.com/gonutz/wui/v2"
+	"github.com/2dprototype/wui"
 
 	"gitlab.com/gomidi/midi/v2"
 	"gitlab.com/gomidi/midi/v2/smf"
@@ -365,6 +365,7 @@ func newMainWindow() *wui.Window {
 	w := wui.NewWindow()
 	w.SetTitle("FLP (FL Studio Project) Tool")
 	w.SetSize(defaultW, defaultH)
+	w.SetCenterOnShow(true)
 	w.SetResizable(true)
 	w.SetBackground(colBG)
 	w.SetHasMinButton(true)
@@ -402,6 +403,7 @@ func newMainWindow() *wui.Window {
 		{"Channel Browser", openChannelTool},
 		{"Pattern Browser", openPatternTool},
 		{"Mixer Browser", openMixerTool},
+		{"Asset Viewer", openAssetTool},
 		{"Git Integration", openGitTool},
 		{"About", openAboutTool},
 	}
@@ -488,10 +490,10 @@ func newMainWindow() *wui.Window {
 
 		btnLoad.SetBounds(sidebarW+40, ih-80, 160, 40)
 
-		y := 80
+		y := 60
 		for _, b := range btns {
-			b.SetBounds(margin, y, sidebarW-2*margin, 36)
-			y += 42
+			b.SetBounds(margin, y, sidebarW-2*margin, 35)
+			y += 40
 		}
 	})
 
@@ -503,6 +505,7 @@ func newModal(title string) *wui.Window {
 	w := wui.NewWindow()
 	w.SetTitle(title)
 	w.SetSize(defaultW, defaultH)
+	w.SetCenterOnShow(true)
 	w.SetResizable(true)
 	w.SetBackground(colBG)
 	w.SetHasMinButton(true)
@@ -2794,6 +2797,442 @@ func openAboutTool(_ *wui.Window) {
 			lbl.SetBounds(margin*2, startY+i*lineH, iw-4*margin, lineH)
 		}
 		btnClose.SetBounds(iw-margin-closeBtnW, ih-margin-btnH, closeBtnW, btnH)
+	})
+
+	showModal(w)
+}
+
+// ───────────────────────── 10. Asset Viewer ─────────────────────────
+
+func openAssetTool(_ *wui.Window) {
+	if app.Project == nil {
+		wui.MessageBoxInfo("Asset Viewer", "Please load a project first.")
+		return
+	}
+
+	p := app.Project
+	w := newModal("Asset Viewer - " + filepath.Base(app.Path))
+
+	tree := wui.NewTreeView()
+	w.Add(tree)
+
+	lblTitle := wui.NewLabel()
+	lblTitle.SetText("Select an item")
+	if fontBold != nil {
+		lblTitle.SetFont(fontBold)
+	}
+	w.Add(lblTitle)
+
+	det := newOutput(0, 0, 100, 100)
+	setText(det, "Select a node from the tree on the left to see its details.")
+	w.Add(det)
+
+	btnPrimary := newBtn("No Action", 0, 0, 160, btnH, nil)
+	btnPrimary.SetEnabled(false)
+	w.Add(btnPrimary)
+	btnCopy := newBtn("Copy Details", 0, 0, 130, btnH, nil)
+	w.Add(btnCopy)
+	btnClose := newBtn("Close", 0, 0, closeBtnW, btnH, func() { w.Close() })
+	w.Add(btnClose)
+
+	applyLayout(w, func(iw, ih int) {
+		contentW := iw - 2*margin
+		y := margin
+		bottomH := btnH + margin
+		contentH := ih - y - bottomH
+		if contentH < 80 {
+			contentH = 80
+		}
+		treeW := contentW * 36 / 100
+		if treeW < 200 {
+			treeW = 200
+		}
+		if treeW > contentW-200 {
+			treeW = contentW - 200
+		}
+		if treeW < 100 {
+			treeW = 100
+		}
+		tree.SetBounds(margin, y, treeW, contentH)
+
+		rightX := margin + treeW + rowGap
+		rightW := iw - margin - rightX
+		if rightW < 100 {
+			rightW = 100
+		}
+		lblTitle.SetBounds(rightX, y, rightW, 24)
+		det.SetBounds(rightX, y+28, rightW, contentH-28)
+
+		barY := ih - margin - btnH
+		btnPrimary.SetBounds(margin, barY, 160, btnH)
+		btnCopy.SetBounds(margin+160+rowInnerGap, barY, 130, btnH)
+		btnClose.SetBounds(iw-margin-closeBtnW, barY, closeBtnW, btnH)
+	})
+
+	// ── Node metadata ────────────────────────────────────────────────
+	type nodeAction struct {
+		label string
+		run   func()
+	}
+	type nodeData struct {
+		title  string
+		detail string
+		action *nodeAction
+	}
+
+	data := map[*wui.TreeNode]nodeData{}
+
+	addNode := func(parent *wui.TreeNode, text, title, detail string, act *nodeAction) *wui.TreeNode {
+		var n *wui.TreeNode
+		if parent == nil {
+			n = tree.Add(text)
+		} else {
+			n = parent.Add(text)
+		}
+		data[n] = nodeData{title: title, detail: detail, action: act}
+		return n
+	}
+
+	// ── Project root ─────────────────────────────────────────────────
+	projDetail := func() string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "File: %s\n", app.Path)
+		fmt.Fprintf(&b, "PPQ: %d\n", p.Header.PPQ)
+		if t := flp.GetTempo(p); t != nil {
+			fmt.Fprintf(&b, "Tempo: %.2f BPM\n", *t)
+		}
+		if p.Metadata.TimeSignatureNumerator != nil && p.Metadata.TimeSignatureDenominator != nil {
+			fmt.Fprintf(&b, "Time signature: %d/%d\n",
+				*p.Metadata.TimeSignatureNumerator, *p.Metadata.TimeSignatureDenominator)
+		}
+		fmt.Fprintf(&b, "\nChannels:       %d\n", len(p.Channels))
+		fmt.Fprintf(&b, "Patterns:       %d\n", len(p.Patterns))
+		fmt.Fprintf(&b, "Mixer inserts:  %d\n", len(p.Inserts))
+		fmt.Fprintf(&b, "Arrangements:   %d\n", len(p.Arrangements))
+		return b.String()
+	}
+	rootNode := addNode(nil, "Project", "Project", projDetail(), nil)
+
+	// ── Channels (with sample + plugin sub-nodes) ────────────────────
+	chCat := addNode(rootNode, fmt.Sprintf("Channels (%d)", len(p.Channels)),
+		"Channels", "All channels in the project.", nil)
+	for _, ch := range p.Channels {
+		c := ch
+		name := fmt.Sprintf("#%d", c.Iid)
+		if c.Name != nil && *c.Name != "" {
+			name = *c.Name
+		}
+		cdetail := func() string {
+			var b strings.Builder
+			fmt.Fprintf(&b, "Channel #%d\n", c.Iid)
+			fmt.Fprintf(&b, "Kind: %s\n", c.Kind)
+			if c.Name != nil {
+				fmt.Fprintf(&b, "Name: %s\n", *c.Name)
+			}
+			if c.SamplePath != nil && *c.SamplePath != "" {
+				fmt.Fprintf(&b, "Sample path: %s\n", *c.SamplePath)
+			}
+			if c.Plugin != nil {
+				fmt.Fprintf(&b, "Plugin internal name: %s\n", c.Plugin.InternalName)
+				if c.Plugin.Name != nil {
+					fmt.Fprintf(&b, "Plugin name: %s\n", *c.Plugin.Name)
+				}
+				if c.Plugin.Vendor != nil {
+					fmt.Fprintf(&b, "Vendor: %s\n", *c.Plugin.Vendor)
+				}
+			}
+			if c.Levels != nil {
+				fmt.Fprintf(&b, "Volume: %d\n", c.Levels.Volume)
+				fmt.Fprintf(&b, "Pan: %d\n", c.Levels.Pan)
+			}
+			if c.TargetInsert != nil {
+				fmt.Fprintf(&b, "Routed to insert: %d\n", *c.TargetInsert)
+			}
+			if c.Color != nil {
+				fmt.Fprintf(&b, "Color: rgba(%d,%d,%d,%d)\n",
+					c.Color.R, c.Color.G, c.Color.B, c.Color.A)
+			}
+			if c.AutomationTarget != nil {
+				fmt.Fprintf(&b, "Automation target: %s\n", c.AutomationTarget.Kind)
+			}
+			if n := len(c.AutomationPoints); n > 0 {
+				fmt.Fprintf(&b, "Automation points: %d\n", n)
+			}
+			return b.String()
+		}
+		var act *nodeAction
+		if c.SamplePath != nil && *c.SamplePath != "" {
+			sp := *c.SamplePath
+			act = &nodeAction{label: "Copy Sample Path", run: func() {
+				wui.SetClipboardText(sp)
+			}}
+		}
+		chNode := addNode(chCat, fmt.Sprintf("%s [%s]", name, c.Kind),
+			name, cdetail(), act)
+
+		// Sample sub-node
+		if c.SamplePath != nil && *c.SamplePath != "" {
+			sp := *c.SamplePath
+			sdetail := func() string {
+				var b strings.Builder
+				fmt.Fprintf(&b, "Sample path:\n%s\n\n", sp)
+				fmt.Fprintf(&b, "File:    %s\n", filepath.Base(sp))
+				fmt.Fprintf(&b, "Dir:     %s\n", filepath.Dir(sp))
+				if st, err := os.Stat(sp); err == nil {
+					fmt.Fprintf(&b, "Exists:  yes\n")
+					fmt.Fprintf(&b, "Size:    %d bytes\n", st.Size())
+					fmt.Fprintf(&b, "ModTime: %s\n", st.ModTime().Format("2006-01-02 15:04:05"))
+				} else {
+					fmt.Fprintf(&b, "Exists:  no (%v)\n", err)
+				}
+				return b.String()
+			}
+			sact := &nodeAction{label: "Copy Sample Path", run: func() {
+				wui.SetClipboardText(sp)
+			}}
+			addNode(chNode, "Sample: "+filepath.Base(sp), "Sample", sdetail(), sact)
+		}
+
+		// Plugin sub-node
+		if c.Plugin != nil {
+			plug := c.Plugin
+			pdetail := func() string {
+				var b strings.Builder
+				fmt.Fprintf(&b, "Internal name: %s\n", plug.InternalName)
+				if plug.Name != nil {
+					fmt.Fprintf(&b, "Name:          %s\n", *plug.Name)
+				}
+				if plug.Vendor != nil {
+					fmt.Fprintf(&b, "Vendor:        %s\n", *plug.Vendor)
+				}
+				return b.String()
+			}
+			addNode(chNode, "Plugin: "+plug.InternalName, "Plugin", pdetail(), nil)
+		}
+	}
+
+	// ── Patterns ─────────────────────────────────────────────────────
+	patCat := addNode(rootNode, fmt.Sprintf("Patterns (%d)", len(p.Patterns)),
+		"Patterns", "All patterns in the project.", nil)
+	for _, pt := range p.Patterns {
+		pat := pt
+		name := fmt.Sprintf("#%d", pat.ID)
+		if pat.Name != nil && *pat.Name != "" {
+			name = *pat.Name
+		}
+		pdetail := func() string {
+			var b strings.Builder
+			fmt.Fprintf(&b, "Pattern ID: %d\n", pat.ID)
+			if pat.Name != nil {
+				fmt.Fprintf(&b, "Name: %s\n", *pat.Name)
+			}
+			if pat.Length != nil {
+				fmt.Fprintf(&b, "Length: %d ticks\n", *pat.Length)
+			}
+			if pat.Looped != nil {
+				fmt.Fprintf(&b, "Looped: %v\n", *pat.Looped)
+			}
+			fmt.Fprintf(&b, "Notes: %d\n", len(pat.Notes))
+			fmt.Fprintf(&b, "Controllers: %d\n", len(pat.Controllers))
+			if pat.Color != nil {
+				fmt.Fprintf(&b, "Color: rgba(%d,%d,%d,%d)\n",
+					pat.Color.R, pat.Color.G, pat.Color.B, pat.Color.A)
+			}
+			if len(pat.Notes) > 0 {
+				b.WriteString("\nFirst notes:\n")
+				n := len(pat.Notes)
+				if n > 16 {
+					n = 16
+				}
+				for i := 0; i < n; i++ {
+					note := pat.Notes[i]
+					fmt.Fprintf(&b, "  pos=%-6d key=%-3d len=%-6d ch=%d vel=%d\n",
+						note.Position, note.Key, note.Length, note.ChannelIid, note.Velocity)
+				}
+				if len(pat.Notes) > n {
+					fmt.Fprintf(&b, "  ... and %d more\n", len(pat.Notes)-n)
+				}
+			}
+			return b.String()
+		}
+		addNode(patCat, fmt.Sprintf("%d: %s (%d notes)", pat.ID, name, len(pat.Notes)),
+			name, pdetail(), nil)
+	}
+
+	// ── Mixer inserts ────────────────────────────────────────────────
+	mixCat := addNode(rootNode, fmt.Sprintf("Mixer Inserts (%d)", len(p.Inserts)),
+		"Mixer Inserts", "All mixer inserts and their slots.", nil)
+	for _, ins := range p.Inserts {
+		i := ins
+		name := "(unnamed)"
+		if i.Name != nil && *i.Name != "" {
+			name = *i.Name
+		}
+		idetail := func() string {
+			var b strings.Builder
+			fmt.Fprintf(&b, "Insert index: %d\n", i.Index)
+			if i.Name != nil {
+				fmt.Fprintf(&b, "Name: %s\n", *i.Name)
+			}
+			if i.Volume != nil {
+				fmt.Fprintf(&b, "Volume: %d\n", *i.Volume)
+			}
+			if i.Pan != nil {
+				fmt.Fprintf(&b, "Pan: %d\n", *i.Pan)
+			}
+			if i.Flags != nil {
+				fmt.Fprintf(&b, "Enabled: %v\n", i.Flags.Enabled)
+				fmt.Fprintf(&b, "Locked:  %v\n", i.Flags.Locked)
+				fmt.Fprintf(&b, "Solo:    %v\n", i.Flags.Solo)
+			}
+			if i.Color != nil {
+				fmt.Fprintf(&b, "Color: rgba(%d,%d,%d,%d)\n",
+					i.Color.R, i.Color.G, i.Color.B, i.Color.A)
+			}
+			fmt.Fprintf(&b, "Slots: %d\n", len(i.Slots))
+			return b.String()
+		}
+		insNode := addNode(mixCat, fmt.Sprintf("%d: %s", i.Index, name),
+			name, idetail(), nil)
+		for _, sl := range i.Slots {
+			slot := sl
+			lbl := "(empty)"
+			if slot.HasPlugin != nil && *slot.HasPlugin {
+				switch {
+				case slot.PluginVstName != nil:
+					lbl = *slot.PluginVstName
+				case slot.PluginName != nil:
+					lbl = *slot.PluginName
+				case slot.InternalName != nil:
+					lbl = *slot.InternalName
+				default:
+					lbl = "(unknown plugin)"
+				}
+			}
+			sdetail := func() string {
+				var b strings.Builder
+				fmt.Fprintf(&b, "Slot index: %d\n", slot.Index)
+				if slot.HasPlugin != nil {
+					fmt.Fprintf(&b, "Has plugin: %v\n", *slot.HasPlugin)
+				}
+				if slot.InternalName != nil {
+					fmt.Fprintf(&b, "Internal name: %s\n", *slot.InternalName)
+				}
+				if slot.PluginName != nil {
+					fmt.Fprintf(&b, "Plugin name: %s\n", *slot.PluginName)
+				}
+				if slot.PluginVstName != nil {
+					fmt.Fprintf(&b, "VST name: %s\n", *slot.PluginVstName)
+				}
+				return b.String()
+			}
+			addNode(insNode, fmt.Sprintf("Slot %d: %s", slot.Index, lbl),
+				"Slot "+lbl, sdetail(), nil)
+		}
+	}
+
+	// ── Arrangements / tracks / clips ────────────────────────────────
+	arrCat := addNode(rootNode, fmt.Sprintf("Arrangements (%d)", len(p.Arrangements)),
+		"Arrangements", "All arrangements, tracks and clips.", nil)
+	for _, a := range p.Arrangements {
+		arr := a
+		name := fmt.Sprintf("#%d", arr.ID)
+		if arr.Name != nil && *arr.Name != "" {
+			name = *arr.Name
+		}
+		adetail := func() string {
+			var b strings.Builder
+			fmt.Fprintf(&b, "Arrangement ID: %d\n", arr.ID)
+			if arr.Name != nil {
+				fmt.Fprintf(&b, "Name: %s\n", *arr.Name)
+			}
+			fmt.Fprintf(&b, "Tracks: %d\n", len(arr.Tracks))
+			fmt.Fprintf(&b, "Clips:  %d\n", len(arr.Clips))
+			return b.String()
+		}
+		arrNode := addNode(arrCat, fmt.Sprintf("%d: %s", arr.ID, name),
+			name, adetail(), nil)
+
+		byTrack := map[int][]flp.Clip{}
+		for _, cl := range arr.Clips {
+			idx := 499 - cl.TrackRvidx
+			byTrack[idx] = append(byTrack[idx], cl)
+		}
+
+		for ti, tr := range arr.Tracks {
+			track := tr
+			ti := ti
+			tname := fmt.Sprintf("Track %d", ti+1)
+			if track.Name != nil && *track.Name != "" {
+				tname = *track.Name
+			}
+			tdetail := func() string {
+				var b strings.Builder
+				fmt.Fprintf(&b, "Track index: %d\n", ti)
+				if track.Name != nil {
+					fmt.Fprintf(&b, "Name: %s\n", *track.Name)
+				}
+				if track.Grouped != nil {
+					fmt.Fprintf(&b, "Grouped: %v\n", *track.Grouped)
+				}
+				if track.Color != nil {
+					fmt.Fprintf(&b, "Color: rgba(%d,%d,%d,%d)\n",
+						track.Color.R, track.Color.G, track.Color.B, track.Color.A)
+				}
+				return b.String()
+			}
+			trNode := addNode(arrNode, tname, tname, tdetail(), nil)
+
+			for _, cl := range byTrack[ti] {
+				clip := cl
+				clbl := clipLabel(p, clip)
+				cdetail := func() string {
+					var b strings.Builder
+					fmt.Fprintf(&b, "Clip: %s\n", clbl)
+					fmt.Fprintf(&b, "Position: %d ticks\n", clip.Position)
+					fmt.Fprintf(&b, "Length: %d ticks\n", clip.Length)
+					fmt.Fprintf(&b, "Item index: %d\n", clip.ItemIndex)
+					fmt.Fprintf(&b, "Track row index: %d\n", 499-clip.TrackRvidx)
+					return b.String()
+				}
+				addNode(trNode, clbl, clbl, cdetail(), nil)
+			}
+		}
+	}
+
+	// ── Selection wiring ─────────────────────────────────────────────
+	var current nodeData
+	tree.SetOnSelect(func(n *wui.TreeNode) {
+		d, ok := data[n]
+		if !ok {
+			current = nodeData{}
+			lblTitle.SetText(n.Text())
+			setText(det, "")
+			btnPrimary.SetText("No Action")
+			btnPrimary.SetEnabled(false)
+			return
+		}
+		current = d
+		lblTitle.SetText(d.title)
+		setText(det, d.detail)
+		if d.action != nil {
+			btnPrimary.SetText(d.action.label)
+			btnPrimary.SetEnabled(true)
+		} else {
+			btnPrimary.SetText("No Action")
+			btnPrimary.SetEnabled(false)
+		}
+	})
+
+	btnPrimary.SetOnClick(func() {
+		if current.action != nil {
+			current.action.run()
+		}
+	})
+	btnCopy.SetOnClick(func() {
+		if current.detail != "" {
+			wui.SetClipboardText(current.detail)
+		}
 	})
 
 	showModal(w)
