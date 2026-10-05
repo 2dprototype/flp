@@ -189,15 +189,15 @@ func defaultSynthOptions() SynthOptions {
 		ReverbSize: 0,
 		ReverbMix:  0,
 
-		Gain:      0.6,
+		Gain:      1.0, // Increased for a louder, closer-to-FL master mix
 		VelToAmp:  0.7,
 		VelToFilt: 0,
 
-		// ── Sample defaults: subtle fades, full sustain, no pitch offset ──
-		SampleAttack:  0.001,
+		// ── Sample defaults: 0 attack and 0 release for authentic one-shots ──
+		SampleAttack:  0.0,
 		SampleDecay:   0.0,
 		SampleSustain: 1.0,
-		SampleRelease: 0.005,
+		SampleRelease: 0.0, // Fixed: set to 0 so drum tails aren't cut/blunted
 		SampleVolume:  1.0,
 		SamplePitch:   0.0,
 	}
@@ -270,7 +270,6 @@ func loadSampleCached(path string) []float64 {
 }
 
 // loadSamplePCM decodes a WAV file to a mono []float64 at synthSR.
-// Add cases to `switch ext` for mp3/ogg/flac (one import + one case each).
 func loadSamplePCM(path string) []float64 {
 	f, err := os.Open(path)
 	if err != nil {
@@ -310,7 +309,7 @@ func loadSamplePCM(path string) []float64 {
 		return nil
 	}
 
-	// Resample to synthSR if needed (linear interpolation).
+	// Resample to synthSR if needed (High-Quality Cubic Hermite Interpolation).
 	if format.SampleRate != synthSR {
 		ratio := float64(format.SampleRate) / float64(synthSR)
 		newLen := int(float64(len(out)) / ratio)
@@ -319,10 +318,22 @@ func loadSamplePCM(path string) []float64 {
 			srcPos := float64(i) * ratio
 			i0 := int(srcPos)
 			if i0 >= len(out)-1 {
-				break
+				resampled[i] = out[len(out)-1]
+				continue
 			}
 			frac := srcPos - float64(i0)
-			resampled[i] = out[i0]*(1-frac) + out[i0+1]*frac
+			
+			y1 := out[i0]
+			y2 := out[i0+1]
+			y0, y3 := y1, y2
+			if i0 > 0 { y0 = out[i0-1] }
+			if i0 < len(out)-2 { y3 = out[i0+2] }
+			
+			a0 := -0.5*y0 + 1.5*y1 - 1.5*y2 + 0.5*y3
+			a1 := y0 - 2.5*y1 + 2.0*y2 - 0.5*y3
+			a2 := -0.5*y0 + 0.5*y2
+			
+			resampled[i] = a0*frac*frac*frac + a1*frac*frac + a2*frac + y1
 		}
 		out = resampled
 	}
@@ -435,19 +446,117 @@ func isSampleChannel(ch flp.Channel) bool {
 		ch.SamplePath != nil && *ch.SamplePath != ""
 }
 
-// mixSample mixes a one-shot sample into buf at the note's tick position.
-// The sample is resampled to (note key + SamplePitch) semitones above C5.
-// The envelope is a standard ADSR: Attack ramps 0→1, Decay ramps 1→Sustain,
-// Sustain holds until Release begins, Release ramps Sustain→0 and finishes
-// exactly at the sample's natural end.
-//
-// Key guarantees:
-//   - SampleAttack  == 0  → instant start (no fade-in)
-//   - SampleRelease == 0  → no fade-out; the sample plays to its natural end
-//     and cuts hard (which is often what you want for percussive hits)
-//   - SampleRelease > sample length → the whole sample is a fade-out from
-//     the sustain level down to 0
-func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64, opt SynthOptions) {
+
+// ───────────────────────── sample playback ─────────────────────────
+
+// mixSampleEx mixes a mono sample into buf with an ADSR envelope.
+func mixSampleEx(buf, sample []float64, startSample, maxSamples int,
+	pitchRatio, gain float64, opt SynthOptions, sr float64) {
+
+	if len(sample) < 2 || maxSamples <= 0 || startSample >= len(buf) || pitchRatio <= 0 {
+		return
+	}
+	if gain < 0 {
+		gain = 0
+	}
+	if gain > 4 {
+		gain = 4
+	}
+
+	sampleLen := len(sample)
+	naturalOut := int(float64(sampleLen) / pitchRatio)
+	if naturalOut < maxSamples {
+		maxSamples = naturalOut
+	}
+	if startSample+maxSamples > len(buf) {
+		maxSamples = len(buf) - startSample
+	}
+	if maxSamples <= 0 {
+		return
+	}
+
+	attackSamples := int(opt.SampleAttack * sr)
+	decaySamples := int(opt.SampleDecay * sr)
+	releaseSamples := int(opt.SampleRelease * sr)
+	
+	if attackSamples < 0 { attackSamples = 0 }
+	if decaySamples < 0 { decaySamples = 0 }
+	if releaseSamples < 0 { releaseSamples = 0 }
+	if attackSamples > maxSamples { attackSamples = maxSamples }
+	if decaySamples > maxSamples-attackSamples { decaySamples = maxSamples - attackSamples }
+	if releaseSamples > maxSamples { releaseSamples = maxSamples }
+
+	sustain := opt.SampleSustain
+	if sustain < 0 { sustain = 0 }
+	if sustain > 1 { sustain = 1 }
+
+	attackEnd := attackSamples
+	decayEnd := attackEnd + decaySamples
+	releaseStart := maxSamples - releaseSamples
+	if releaseStart < decayEnd {
+		releaseStart = decayEnd
+	}
+
+	// ── Highly optimized fast-path for non-pitched audio clips ──
+	fastPath := (pitchRatio == 1.0 && attackSamples == 0 && decaySamples == 0 && releaseSamples == 0 && sustain == 1.0)
+
+	for out := 0; out < maxSamples; out++ {
+		var s float64
+		if fastPath {
+			s = sample[out]
+		} else {
+			srcPos := float64(out) * pitchRatio
+			i0 := int(srcPos)
+			if i0 >= sampleLen-1 {
+				s = sample[sampleLen-1]
+			} else {
+				// ── High-Quality Cubic Hermite Interpolation ──
+				frac := srcPos - float64(i0)
+				y1 := sample[i0]
+				y2 := sample[i0+1]
+				y0, y3 := y1, y2
+				if i0 > 0 { y0 = sample[i0-1] }
+				if i0 < sampleLen-2 { y3 = sample[i0+2] }
+
+				a0 := -0.5*y0 + 1.5*y1 - 1.5*y2 + 0.5*y3
+				a1 := y0 - 2.5*y1 + 2.0*y2 - 0.5*y3
+				a2 := -0.5*y0 + 0.5*y2
+
+				s = a0*frac*frac*frac + a1*frac*frac + a2*frac + y1
+			}
+		}
+
+		env := 1.0
+		if !fastPath {
+			if attackSamples > 0 && out < attackEnd {
+				env = float64(out) / float64(attackSamples)
+			} else if out >= attackEnd && out < releaseStart {
+				if decaySamples > 0 && out < decayEnd {
+					t := float64(out-attackEnd) / float64(decaySamples)
+					env = 1.0 - (1.0-sustain)*t
+				} else {
+					env = sustain
+				}
+			} else if releaseSamples > 0 && out >= releaseStart {
+				t := float64(out-releaseStart) / float64(releaseSamples)
+				if t > 1 { t = 1 }
+				env = sustain * (1.0 - t)
+			} else if releaseSamples == 0 && out >= releaseStart {
+				// Prevent ADSR from muting output if there's no release phase
+				env = sustain
+			}
+		}
+
+		buf[startSample+out] += s * env * gain
+	}
+}
+
+// mixSample is the pattern-note entry point. It now respects the piano roll 
+// note length, correctly truncating playback or applying the release tail 
+// when the note ends.
+func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64,
+	opt SynthOptions, channelGain float64) {
+
 	if len(sample) < 2 {
 		return
 	}
@@ -455,228 +564,46 @@ func mixSample(buf []float64, sample []float64, n flp.Note, spt, sr float64, opt
 	if startSample >= len(buf) {
 		return
 	}
-
-	vel := float64(n.Velocity) / 127.0
-	if vel <= 0 {
-		vel = 1
-	}
-	vol := opt.SampleVolume
-	if vol < 0 {
-		vol = 0
-	}
-	if vol > 4 {
-		vol = 4
-	}
-
-	// Pitch ratio: note key relative to C5 (MIDI 60) plus user semitone offset.
 	pitchRatio := math.Pow(2.0, (float64(n.Key-60)+opt.SamplePitch)/12.0)
 	if pitchRatio <= 0 {
 		return
 	}
-
-	sampleLen := len(sample)
-	maxOut := int(float64(sampleLen) / pitchRatio)
-	if startSample+maxOut > len(buf) {
-		maxOut = len(buf) - startSample
+	vel := float64(n.Velocity) / 127.0
+	if vel <= 0 {
+		vel = 1
 	}
-	if maxOut <= 0 {
-		return
-	}
+	gain := opt.SampleVolume * channelGain * vel
+	naturalOut := int(float64(len(sample)) / pitchRatio)
 
-	// ── Envelope parameters, clamped to the actual output length ──
-	attackSamples := int(opt.SampleAttack * sr)
-	decaySamples := int(opt.SampleDecay * sr)
+	// Calculate exact note duration in samples based on piano roll length
+	noteSamples := int(float64(n.Length) * spt * sr)
 	releaseSamples := int(opt.SampleRelease * sr)
+	
+	// Total playback length is the held note duration + the release tail
+	maxSamples := noteSamples + releaseSamples
 
-	if attackSamples < 0 {
-		attackSamples = 0
-	}
-	if decaySamples < 0 {
-		decaySamples = 0
-	}
-	if releaseSamples < 0 {
-		releaseSamples = 0
-	}
-	if attackSamples > maxOut {
-		attackSamples = maxOut
-	}
-	if decaySamples > maxOut-attackSamples {
-		decaySamples = maxOut - attackSamples
-	}
-	if releaseSamples > maxOut {
-		releaseSamples = maxOut
+	// Cap playback at the sample's natural length to prevent out-of-bounds reading
+	if maxSamples > naturalOut {
+		maxSamples = naturalOut
 	}
 
-	sustain := opt.SampleSustain
-	if sustain < 0 {
-		sustain = 0
-	}
-	if sustain > 1 {
-		sustain = 1
-	}
-
-	attackEnd := attackSamples
-	decayEnd := attackEnd + decaySamples
-	// Release begins so the fade completes exactly at the sample end.
-	releaseStart := maxOut - releaseSamples
-	if releaseStart < 0 {
-		releaseStart = 0
-	}
-	if releaseStart < decayEnd {
-		releaseStart = decayEnd
-	}
-
-	for out := 0; out < maxOut; out++ {
-		srcPos := float64(out) * pitchRatio
-		i0 := int(srcPos)
-		if i0 >= sampleLen-1 {
-			break
-		}
-		frac := srcPos - float64(i0)
-		s := sample[i0]*(1-frac) + sample[i0+1]*frac
-
-		// Envelope: minimum of attack ramp, decay curve and release ramp.
-		env := 1.0
-
-		// Attack
-		if attackSamples > 0 && out < attackEnd {
-			a := float64(out) / float64(attackSamples)
-			if a < env {
-				env = a
-			}
-		}
-
-		// Decay to sustain
-		if out >= attackEnd {
-			var d float64
-			if decaySamples > 0 && out < decayEnd {
-				t := float64(out-attackEnd) / float64(decaySamples)
-				d = 1.0 - (1.0-sustain)*t
-			} else {
-				d = sustain
-			}
-			if d < env {
-				env = d
-			}
-		}
-
-		// Release (only when releaseSamples > 0; release==0 means hard cut)
-		if releaseSamples > 0 && out >= releaseStart {
-			t := float64(out-releaseStart) / float64(releaseSamples)
-			if t > 1 {
-				t = 1
-			}
-			r := sustain * (1.0 - t)
-			if r < env {
-				env = r
-			}
-		}
-
-		buf[startSample+out] += s * env * vel * vol
-	}
+	mixSampleEx(buf, sample, startSample, maxSamples, pitchRatio, gain, opt, sr)
 }
 
-// renderArrangement flattens every pattern clip in an arrangement into a
-// single synthetic pattern whose notes are already positioned at their
-// absolute arrangement ticks, then hands it to renderPattern. Channel
-// (audio / automation) clips are skipped.
+// ───────────────────────── pattern / arrangement renderer ─────────────────────────
+
+// renderPatternWithClips is the real rendering pipeline. It mixes:
 //
-// Loop handling: when a clip is longer than its source pattern, the pattern
-// is repeated until the clip is filled — matching FL Studio's playlist
-// behaviour.
-func renderArrangement(arr flp.Arrangement, patterns []flp.Pattern, ppq int,
-	bpm float64, opt SynthOptions, channels []flp.Channel, flpPath string) []float64 {
-
-	patByID := make(map[int]flp.Pattern, len(patterns))
-	for _, p := range patterns {
-		patByID[p.ID] = p
-	}
-
-	// Rough capacity estimate to avoid repeated reallocation.
-	totalNotes := 0
-	for _, cl := range arr.Clips {
-		if cl.ItemIndex <= 20480 {
-			continue
-		}
-		if pat, ok := patByID[cl.ItemIndex-20480]; ok {
-			totalNotes += len(pat.Notes) * 2
-		}
-	}
-	if totalNotes < 64 {
-		totalNotes = 64
-	}
-
-	synth := flp.Pattern{
-		Notes: make([]flp.Note, 0, totalNotes),
-	}
-
-	for _, cl := range arr.Clips {
-		if cl.ItemIndex <= 20480 {
-			continue // channel clip — skip
-		}
-		patID := cl.ItemIndex - 20480
-		pat, ok := patByID[patID]
-		if !ok || len(pat.Notes) == 0 {
-			continue
-		}
-
-		// Determine the pattern's natural length for loop handling.
-		patLen := uint32(0)
-		if pat.Length != nil && *pat.Length > 0 {
-			patLen = *pat.Length
-		} else {
-			for _, n := range pat.Notes {
-				if e := n.Position + n.Length; e > patLen {
-					patLen = e
-				}
-			}
-		}
-		if patLen == 0 {
-			continue
-		}
-
-		// Number of pattern repetitions that fit inside the clip.
-		numRepeats := (cl.Length + patLen - 1) / patLen
-		if numRepeats == 0 {
-			numRepeats = 1
-		}
-
-		clipEnd := cl.Position + cl.Length
-
-		for rep := uint32(0); rep < numRepeats; rep++ {
-			repOffset := rep * patLen
-			for _, n := range pat.Notes {
-				if n.Length == 0 {
-					continue
-				}
-				absStart := cl.Position + repOffset + n.Position
-				if absStart >= clipEnd {
-					continue
-				}
-				absEnd := absStart + n.Length
-				if absEnd > clipEnd {
-					absEnd = clipEnd
-				}
-				if absEnd <= absStart {
-					continue
-				}
-				nn := n
-				nn.Position = absStart
-				nn.Length = absEnd - absStart
-				synth.Notes = append(synth.Notes, nn)
-			}
-		}
-	}
-
-	return renderPattern(synth, ppq, bpm, opt, channels, flpPath)
-}
-
-// renderPattern renders a pattern to PCM. Channels whose kind is "sampler"
-// and whose sample path resolves to a readable file are rendered with sample
-// playback (one-shot, pitch-shifted by note key). All other notes go through
-// the synth engine.
-func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
-	channels []flp.Channel, flpPath string) []float64 {
+//  1. every note in pat (sampler notes → sample playback, the rest → synth)
+//  2. every extraChannelClip (playlist audio clips), truncated to the
+//     clip's playlist length
+//
+// into a single buffer, then applies drive → delay → reverb → master gain.
+//
+// renderPattern is a thin wrapper that passes no extra clips; renderArrangement
+// uses it to feed in the arrangement's channel clips.
+func renderPatternWithClips(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
+	channels []flp.Channel, flpPath string, extraChannelClips []flp.Clip) []float64 {
 
 	if ppq <= 0 {
 		ppq = 96
@@ -688,31 +615,51 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
 	spt := 1.0 / tps
 	sr := float64(synthSR)
 
-	// Channel lookup + per-channel sample pre-resolution (once).
+	// ── Channel lookup + per-channel sample/gain pre-resolution (once) ──
 	chByIid := make(map[int]flp.Channel, len(channels))
 	for _, ch := range channels {
 		chByIid[ch.Iid] = ch
 	}
 	chanSamples := make(map[int][]float64)
+	chanGains := make(map[int]float64, len(channels))
 	haveSamples := false
-	if flpPath != "" {
-		for iid, ch := range chByIid {
-			if !isSampleChannel(ch) {
-				continue
+	for iid, ch := range chByIid {
+		// Per-channel gain: FL stores volume in a 0..12800 range where
+		// 12800 is the setter's "1.0" (see mutations_transform.go).
+		g := 1.0
+		if ch.Levels != nil {
+			g = float64(ch.Levels.Volume) / 12800.0
+			if g < 0 {
+				g = 0
 			}
-			if resolved := resolveSamplePath(flpPath, *ch.SamplePath); resolved != "" {
-				if smp := loadSampleCached(resolved); len(smp) > 0 {
-					chanSamples[iid] = smp
-					haveSamples = true
-				}
+			if g > 2 {
+				g = 2
 			}
+		}
+		chanGains[iid] = g
+
+		if !isSampleChannel(ch) || flpPath == "" {
+			continue
+		}
+		resolved := resolveSamplePath(flpPath, *ch.SamplePath)
+		if resolved == "" {
+			continue
+		}
+		if smp := loadSampleCached(resolved); len(smp) > 0 {
+			chanSamples[iid] = smp
+			haveSamples = true
 		}
 	}
 
-	// Buffer length: last note end + longest release + effects tail.
+	// ── Buffer length: max of pattern-note ends and clip ends + tail ──
 	var maxTick uint32
 	for _, n := range pat.Notes {
 		if e := n.Position + n.Length; e > maxTick {
+			maxTick = e
+		}
+	}
+	for _, cl := range extraChannelClips {
+		if e := cl.Position + cl.Length; e > maxTick {
 			maxTick = e
 		}
 	}
@@ -727,19 +674,19 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
 	if opt.ReverbMix > 0.01 {
 		tail += 2.0
 	}
-	if haveSamples {
-		tail += 2.0 // one-shots can run past their note
+	if haveSamples || len(extraChannelClips) > 0 {
+		tail += 2.0
 	}
 	totalSec := float64(maxTick)*spt + tail + 0.1
 	if totalSec < 0.2 {
 		totalSec = 0.2
 	}
 	buf := make([]float64, int(totalSec*sr))
-	if len(pat.Notes) == 0 {
+	if len(pat.Notes) == 0 && len(extraChannelClips) == 0 {
 		return buf
 	}
 
-	// Waveform tables (nil = noise).
+	// ── Waveform tables (nil = noise) ──
 	var table1, table2 []float64
 	if opt.Waveform1 != "noise" {
 		table1 = wavetables.table(opt.Waveform1)
@@ -934,30 +881,53 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
 				filtCountdown--
 				osc = filt.process(osc)
 			}
-
+			
 			buf[i] += osc
 		}
 	}
 
-	// Route each note: sample playback if channel is a sampler with a
-	// resolvable file, otherwise synth.
+	// ── 1) Pattern notes ──
 	for _, n := range pat.Notes {
 		if smp, ok := chanSamples[n.ChannelIid]; ok {
-			mixSample(buf, smp, n, spt, sr, opt)
+			mixSample(buf, smp, n, spt, sr, opt, chanGains[n.ChannelIid])
 			continue
 		}
 		renderVoice(n)
 	}
 
-	// ── Post: drive ──
+	// ── 2) Extra channel clips (playlist audio / sampler) ──
+	// Each clip plays its sample from cl.Position for at most cl.Length ticks.
+	// That's the "sample length as the FLP data says" behaviour.
+	for _, cl := range extraChannelClips {
+		smp, ok := chanSamples[cl.ItemIndex]
+		if !ok || len(smp) < 2 {
+			continue
+		}
+		startSample := int(float64(cl.Position) * spt * sr)
+		if startSample >= len(buf) {
+			continue
+		}
+		clipSamples := int(float64(cl.Length) * spt * sr)
+		if clipSamples <= 0 {
+			continue
+		}
+		// Audio clips play at original pitch (Key=60), so the pitch ratio
+		// comes solely from the user's global SamplePitch.
+		pitchRatio := math.Pow(2.0, opt.SamplePitch/12.0)
+		if pitchRatio <= 0 {
+			continue
+		}
+		gain := opt.SampleVolume * chanGains[cl.ItemIndex] // clips are unity velocity
+		mixSampleEx(buf, smp, startSample, clipSamples, pitchRatio, gain, opt, sr)
+	}
+
+	// ── 3) Master chain: drive → delay → reverb → gain ──
 	if opt.Drive > 0.001 {
 		d := 1.0 + opt.Drive*15
 		for i, v := range buf {
 			buf[i] = math.Tanh(v * d)
 		}
 	}
-
-	// ── Post: delay ──
 	if opt.DelayMix > 0.001 && opt.DelayTime > 0.001 {
 		dl := newDelayLine(int(opt.DelayTime*sr) + 4)
 		ds := opt.DelayTime * sr
@@ -969,16 +939,12 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
 			buf[i] = dl.process(buf[i], ds, fb, opt.DelayMix)
 		}
 	}
-
-	// ── Post: reverb ──
 	if opt.ReverbMix > 0.001 {
 		rv := newReverb()
 		for i := range buf {
 			buf[i] = rv.process(buf[i], opt.ReverbSize, opt.ReverbMix)
 		}
 	}
-
-	// ── Master gain + safety soft-clip ──
 	g := opt.Gain
 	if g <= 0 {
 		g = 1
@@ -987,6 +953,130 @@ func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
 		buf[i] = math.Tanh(v * g)
 	}
 	return buf
+}
+
+// renderPattern is the pattern-only entry point used by PlayPattern,
+// previewBuf and any other caller that doesn't have channel clips to feed.
+func renderPattern(pat flp.Pattern, ppq int, bpm float64, opt SynthOptions,
+	channels []flp.Channel, flpPath string) []float64 {
+	return renderPatternWithClips(pat, ppq, bpm, opt, channels, flpPath, nil)
+}
+
+// renderArrangement flattens an arrangement into a single buffer.
+//
+//   - Pattern clips are expanded into absolute-time notes (with looping when
+//     the clip is longer than the source pattern), and rendered through the
+//     normal pattern pipeline.
+//   - Channel clips (audio / sampler placed directly on the playlist) are
+//     collected separately and mixed in with their clip length as a hard cap,
+//     so a 1-beat clip can't bleed its whole sample across 4 beats.
+//   - Automation clips are ignored.
+//
+// All voices — pattern notes, pattern sampler notes and channel clips — go
+// through the same master chain (drive, delay, reverb, gain) afterwards.
+func renderArrangement(arr flp.Arrangement, patterns []flp.Pattern, ppq int,
+	bpm float64, opt SynthOptions, channels []flp.Channel, flpPath string) []float64 {
+
+	patByID := make(map[int]flp.Pattern, len(patterns))
+	for _, p := range patterns {
+		patByID[p.ID] = p
+	}
+	chByIid := make(map[int]flp.Channel, len(channels))
+	for _, ch := range channels {
+		chByIid[ch.Iid] = ch
+	}
+
+	// Rough capacity estimate.
+	totalNotes := 0
+	for _, cl := range arr.Clips {
+		if cl.ItemIndex > 20480 {
+			if pat, ok := patByID[cl.ItemIndex-20480]; ok {
+				totalNotes += len(pat.Notes) * 2
+			}
+		}
+	}
+	if totalNotes < 64 {
+		totalNotes = 64
+	}
+
+	synth := flp.Pattern{
+		Notes: make([]flp.Note, 0, totalNotes),
+	}
+	channelClips := make([]flp.Clip, 0, len(arr.Clips))
+
+	for _, cl := range arr.Clips {
+		// ── Channel clip → collect for the clip-aware mixer ──
+		if cl.ItemIndex <= 20480 {
+			ch, ok := chByIid[cl.ItemIndex]
+			if !ok || !isSampleChannel(ch) {
+				continue // automation or instrument channel clip
+			}
+			if ch.SamplePath == nil || *ch.SamplePath == "" {
+				continue
+			}
+			if resolveSamplePath(flpPath, *ch.SamplePath) == "" {
+				continue
+			}
+			if cl.Length == 0 {
+				continue
+			}
+			channelClips = append(channelClips, cl)
+			continue
+		}
+
+		// ── Pattern clip → expand into absolute-time notes (with looping) ──
+		patID := cl.ItemIndex - 20480
+		pat, ok := patByID[patID]
+		if !ok || len(pat.Notes) == 0 {
+			continue
+		}
+
+patLen := uint32(0)
+		if pat.Length != nil && *pat.Length > 0 {
+			patLen = *pat.Length
+		} else {
+			for _, n := range pat.Notes {
+				if e := n.Position + n.Length; e > patLen {
+					patLen = e
+				}
+			}
+		}
+		if patLen == 0 {
+			continue
+		}
+
+		numRepeats := (cl.Length + patLen - 1) / patLen
+		if numRepeats == 0 {
+			numRepeats = 1
+		}
+		clipEnd := cl.Position + cl.Length
+
+		for rep := uint32(0); rep < numRepeats; rep++ {
+			repOffset := rep * patLen
+			for _, n := range pat.Notes {
+				if n.Length == 0 {
+					continue
+				}
+				absStart := cl.Position + repOffset + n.Position
+				if absStart >= clipEnd {
+					continue
+				}
+				absEnd := absStart + n.Length
+				if absEnd > clipEnd {
+					absEnd = clipEnd
+				}
+				if absEnd <= absStart {
+					continue
+				}
+				nn := n
+				nn.Position = absStart
+				nn.Length = absEnd - absStart
+				synth.Notes = append(synth.Notes, nn)
+			}
+		}
+	}
+
+	return renderPatternWithClips(synth, ppq, bpm, opt, channels, flpPath, channelClips)
 }
 
 // previewBuf renders a short two-note demo (C4, then G4) with the given
@@ -1043,8 +1133,8 @@ func newADSR(a, d, s, r, sr float64) *adsr {
 	if d < 0.0005 {
 		d = 0.0005
 	}
-	if r < 0.0005 {
-		r = 0.0005
+	if r < 0 {
+		r = 0
 	}
 	return &adsr{
 		phase:      adsrAttack,
@@ -1053,6 +1143,19 @@ func newADSR(a, d, s, r, sr float64) *adsr {
 		sustain:    s,
 		releaseInc: 0, // set on release
 	}
+}
+
+func (e *adsr) releaseFrom(seconds, sr float64) {
+	if e.phase == adsrDone || e.phase == adsrRelease {
+		return
+	}
+	if seconds <= 0 {
+		e.value = 0
+		e.phase = adsrDone
+		return
+	}
+	e.releaseInc = e.value / (seconds * sr)
+	e.phase = adsrRelease
 }
 
 func (e *adsr) tick() float64 {
@@ -1079,16 +1182,6 @@ func (e *adsr) tick() float64 {
 	return e.value
 }
 
-func (e *adsr) releaseFrom(seconds, sr float64) {
-	if e.phase == adsrDone || e.phase == adsrRelease {
-		return
-	}
-	if seconds < 0.0005 {
-		seconds = 0.0005
-	}
-	e.releaseInc = e.value / (seconds * sr)
-	e.phase = adsrRelease
-}
 
 func (e *adsr) done() bool { return e.phase == adsrDone }
 
